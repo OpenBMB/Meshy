@@ -137,7 +137,7 @@ are synchronous callables taking one completed sample and returning a scalar.
 
 For a more specialized implementation, see the length and overlong reward
 shaping in [meshy/advantage.py](../meshy/advantage.py) and its configuration in
-[math_grpo_minicpm5_2_6b.py](../recipe/math_grpo_minicpm5_2_6b.py).
+[math_grpo_minicpm5_2b.py](../recipe/math_grpo_minicpm5_2b.py).
 
 ## 2. Write a Service
 

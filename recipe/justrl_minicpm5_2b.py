@@ -1,16 +1,17 @@
-"""Four-GPU colocated JustRL recipe for MiniCPM5-2.6B.
+"""JustRL (GRPO) recipe for MiniCPM5-2B on DAPO-Math-17k.
 
-Topology:
+This keeps the production topology and hyperparameters from :mod:`recipe.justrl`
+while replacing the policy model with MiniCPM5-2B:
 
-* inference: 4 single-card SGLang replicas;
-* training: one 4-card TorchTitan trainer colocated with inference;
+* inference: 8 single-card SGLang replicas;
+* training: one 8-card TorchTitan trainer;
 * rollout: one CPU-only rollout driver.
 
 Run with the launcher::
 
-    MINICPM5_LOCAL_PATH=/path/to/minicpm5-2.6b \
-        CUDA_VISIBLE_DEVICES=0,1,2,3 \
-        python scripts/launch.py --recipe recipe.justrl_minicpm5_2_6b_4gpu
+    MINICPM5_LOCAL_PATH=/path/to/minicpm5-2b \
+        CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+        python scripts/launch.py --recipe recipe.justrl_minicpm5_2b
 
 ``MINICPM5_LOCAL_PATH`` is required and must point to the model checkpoint.
 """
@@ -38,7 +39,7 @@ except KeyError as exc:
     raise RuntimeError(
         "MINICPM5_LOCAL_PATH must be set to the MiniCPM5 checkpoint path"
     ) from exc
-NUM_INFERENCE_ENGINES = 4
+NUM_INFERENCE_ENGINES = 8
 
 ROLLOUT_BATCH = 256
 GROUP_SIZE = 8
@@ -46,18 +47,6 @@ BATCH_SIZE = ROLLOUT_BATCH * GROUP_SIZE
 NUM_EPOCHS = 8
 
 VERBOSE_TRAJECTORY_LOG = False
-
-
-def _validate_local_model() -> None:
-    model_dir = Path(MODEL_PATH)
-    required_files = ("config.json", "tokenizer.json", "model.safetensors.index.json")
-    missing = [name for name in required_files if not (model_dir / name).is_file()]
-    if not model_dir.is_dir() or missing or not any(model_dir.glob("*.safetensors")):
-        detail = f"; missing files: {missing}" if missing else ""
-        raise FileNotFoundError(
-            f"MiniCPM5 must be loaded from a complete local model directory: "
-            f"{model_dir}{detail}"
-        )
 
 
 def _sampling_params() -> SamplingParams:
@@ -72,7 +61,7 @@ def _sampling_params() -> SamplingParams:
 def _trainer_config() -> TrainerConfig:
     return TrainerConfig(
         model_name="minicpm5",
-        model_flavor="2.6B",
+        model_flavor="2B",
         seq_len=16384,
         lr=1e-6,
         weight_decay=0.1,
@@ -82,12 +71,12 @@ def _trainer_config() -> TrainerConfig:
         dtype="bfloat16",
         compile_model=True,
         dp_shard_degree=-1,
-        dp_replicate_degree=4,
+        dp_replicate_degree=8,
         tp_degree=1,
         cp_degree=1,
         enable_checkpoint=True,
         checkpoint_folder="checkpoint",
-        dump_folder="./outputs/justrl_minicpm5_2_6b_4gpu",
+        dump_folder="./outputs/justrl_minicpm5_2b",
     )
 
 
@@ -173,7 +162,6 @@ COLOCATIONS = [
 
 
 def main() -> None:
-    _validate_local_model()
     Ignitor(SERVICE_GROUPS, COLOCATIONS).run()
 
 

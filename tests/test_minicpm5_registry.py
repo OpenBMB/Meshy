@@ -7,8 +7,8 @@ from meshy.backend.titan.config import build_forge_config
 from meshy.backend.titan.models.minicpm5 import MiniCPM5StateDictAdapter, model_registry
 
 
-def test_minicpm5_2_6b_matches_hf_architecture():
-    spec = model_registry("2.6B")
+def test_minicpm5_2b_matches_hf_architecture():
+    spec = model_registry("2B")
     config = spec.model
     attention = config.layers[0].attention
     feed_forward = config.layers[0].feed_forward
@@ -65,14 +65,14 @@ def test_build_forge_config_resolves_minicpm5_and_hf_load(monkeypatch, tmp_path)
     config = build_forge_config(
         TrainerConfig(
             model_name="minicpm5",
-            model_flavor="2.6B",
+            model_flavor="2B",
             seq_len=16,
         ),
         hf_model_path="/tmp/minicpm5",
     )
 
     assert config.model_spec.name == "minicpm5"
-    assert config.model_spec.flavor == "2.6B"
+    assert config.model_spec.flavor == "2B"
     assert config.hf_assets_path == "/tmp/minicpm5"
     assert config.checkpoint.enable is True
     assert config.checkpoint.folder == "checkpoint"
@@ -82,7 +82,7 @@ def test_build_forge_config_resolves_minicpm5_and_hf_load(monkeypatch, tmp_path)
 
 def test_rope_permute_roundtrip_on_gqa_kv_shape():
     """The failing load path views wk as [n_kv_heads=2, 64, 2, 2048]."""
-    adapter = MiniCPM5StateDictAdapter(model_registry("2.6B").model, None)
+    adapter = MiniCPM5StateDictAdapter(model_registry("2B").model, None)
     n_kv_heads = 2
     dim1, dim2 = 256, 2048
     weight = torch.randn(dim1, dim2)

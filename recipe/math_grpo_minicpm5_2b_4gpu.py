@@ -1,7 +1,7 @@
 """4-GPU 128k MiniCPM5 GRPO recipe for the local JSONL dataset.
 
 Run with ``MINICPM5_LOCAL_PATH=/path/to/model S9_DATASET_PATH=/path/to/s9.jsonl
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/launch.py --recipe recipe.math_grpo_minicpm5_2_6b_4gpu``.
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/launch.py --recipe recipe.math_grpo_minicpm5_2b_4gpu``.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def _sampling_params() -> SamplingParams:
 def _trainer_config() -> TrainerConfig:
     return TrainerConfig(
         model_name="minicpm5",
-        model_flavor="2.6B",
+        model_flavor="2B",
         seq_len=SEQ_LEN,
         steps=NUM_STEPS,
         lr=1e-6,
@@ -76,7 +76,7 @@ def _trainer_config() -> TrainerConfig:
         cp_degree=4,
         enable_checkpoint=True,
         checkpoint_folder="checkpoint",
-        dump_folder="./outputs/justrl_minicpm5_2_6b_s9_long",
+        dump_folder="./outputs/justrl_minicpm5_2b_s9_long",
     )
 
 

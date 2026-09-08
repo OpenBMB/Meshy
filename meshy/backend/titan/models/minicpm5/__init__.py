@@ -1,6 +1,6 @@
 """MiniCPM5 model registry for TorchTitan's ForgeEngine.
 
-MiniCPM5-1B and MiniCPM5-2.6B are published as ``LlamaForCausalLM`` and use
+MiniCPM5-1B and MiniCPM5-2B are published as ``LlamaForCausalLM`` and use
 the standard Llama parameter layout. Their dimensions do not match any
 built-in TorchTitan Llama flavor, so this module supplies exact model configs
 while reusing the upstream implementation and parallelization code. The
@@ -141,8 +141,8 @@ def _minicpm5_1b(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _minicpm5_2_6b(attn_backend: str = "sdpa") -> Llama3Model.Config:
-    """Build the exact architecture from ``openbmb/MiniCPM5-2.6B``."""
+def _minicpm5_2b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+    """Build the exact architecture from ``openbmb/MiniCPM5-2B``."""
     return _minicpm5_model(
         dim=2048,
         n_heads=16,
@@ -157,7 +157,7 @@ def _minicpm5_2_6b(attn_backend: str = "sdpa") -> Llama3Model.Config:
 
 minicpm5_configs = {
     "1B": _minicpm5_1b,
-    "2.6B": _minicpm5_2_6b,
+    "2B": _minicpm5_2b,
 }
 
 

@@ -12,8 +12,8 @@ Examples::
 
     # 8-card FSDP, padded layout (the default), first 512 samples, 3 timed steps
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node 8 \\
-        scripts/bench_train_only.py --model-path /path/to/MiniCPM5-2.6B \\
-        --model-name minicpm5 --model-flavor 2.6B --seq-len 131072 \\
+        scripts/bench_train_only.py --model-path /path/to/MiniCPM5-2B \\
+        --model-name minicpm5 --model-flavor 2B --seq-len 131072 \\
         --trajectories .xrl_runtime/<run>/trajectories.jsonl --num-samples 512 \\
         --dp-replicate 2 --cp 4 --ac-mode full --compile --steps 3
 
@@ -224,7 +224,7 @@ def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-path", required=True, help="HF model dir (weights + tokenizer)")
     p.add_argument("--model-name", default="minicpm5")
-    p.add_argument("--model-flavor", default="2.6B")
+    p.add_argument("--model-flavor", default="2B")
     p.add_argument("--trajectories", required=True)
     p.add_argument("--num-samples", "-n", type=int, required=True)
     p.add_argument("--seq-len", type=int, default=131072)

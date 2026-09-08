@@ -1,4 +1,4 @@
-"""Single-GPU ForgeEngine smoke test for MiniCPM5-2.6B.
+"""Single-GPU ForgeEngine smoke test for MiniCPM5-2B.
 
 This exercises the same ``build_forge_config -> TitanTrainer -> ForgeEngine``
 path used by Meshy, including Hugging Face checkpoint conversion.
@@ -6,7 +6,7 @@ path used by Meshy, including Hugging Face checkpoint conversion.
 Run from the repository root:
 
     CUDA_VISIBLE_DEVICES=0 python scripts/smoke/minicpm5_forge.py \
-        --model-path /user/zhaotianyun/minicpm5-2.6b
+        --model-path /user/zhaotianyun/minicpm5-2b
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("/user/zhaotianyun/minicpm5-2.6b"),
+        default=Path("/user/zhaotianyun/minicpm5-2b"),
     )
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--master-port", type=int, default=29517)
@@ -83,7 +83,7 @@ def main() -> int:
 
     trainer_config = TrainerConfig(
         model_name="minicpm5",
-        model_flavor="2.6B",
+        model_flavor="2B",
         seq_len=args.seq_len,
         steps=1,
         dtype="bfloat16",
@@ -149,7 +149,7 @@ def main() -> int:
             raise RuntimeError("No finite non-zero gradient was produced")
 
         print(
-            "PASS: MiniCPM5-2.6B HF weights loaded through ForgeEngine; "
+            "PASS: MiniCPM5-2B HF weights loaded through ForgeEngine; "
             f"loss={loss.item():.6f}, params={trainer.model_param_count:,}",
             flush=True,
         )

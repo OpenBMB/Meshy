@@ -337,7 +337,7 @@ def test_forge_config_threads_attn_backend():
     from meshy.backend.titan.config import build_forge_config
     from meshy.backend.titan.trainer import _attn_backend_of
 
-    for name, flavor in (("qwen3", "0.6B"), ("qwen2_5", "0.5B"), ("minicpm5", "2.6B")):
+    for name, flavor in (("qwen3", "0.6B"), ("qwen2_5", "0.5B"), ("minicpm5", "2B")):
         for backend in ("sdpa", "varlen"):
             cfg = build_forge_config(TrainerConfig(
                 model_name=name, model_flavor=flavor, attn_backend=backend,

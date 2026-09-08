@@ -118,9 +118,9 @@ python scripts/launch.py --recipe recipe.<name>
 | `justrl_async` | same | same | 2 | Bounded off-policy overlap: generation may run one batch ahead of training |
 | `justrl_fully_async` | same | 16 cards; 8×TP1 inference + 1×DDP8 trainer, disaggregated | `None` | Fully asynchronous with `stream_minibatch`: the trainer steps as chunks arrive |
 | `justrl_smoke` | same | 8 cards, colocated | 1 | Two-batch, one-epoch version of `justrl` for end-to-end checks |
-| `justrl_minicpm5_1b` / `_2_6b` / `_2_6b_4gpu` | MiniCPM5-1B / 2.6B · DAPO-Math-17k | 8 cards (or 4) colocated | 1 | JustRL setup on the MiniCPM5 family |
+| `justrl_minicpm5_1b` / `_2b` / `_2b_4gpu` | MiniCPM5-1B / 2B · DAPO-Math-17k | 8 cards (or 4) colocated | 1 | JustRL setup on the MiniCPM5 family |
 | `justrl_qwen3_30b_a3b` | Qwen3-30B-A3B (MoE) · DAPO-Math-17k | 8 cards; 1×(TP8 + EP8) inference colocated with 1×FSDP8 trainer | 1 | MoE inference with expert parallel; 16k context |
-| `math_grpo_minicpm5_2_6b` / `_4gpu` | MiniCPM5-2.6B · local S9 math set | 8 cards (or 4); 8×TP1 inference colocated with a CP4 trainer | `None` | 128k context: context parallel, dynamic batching, custom advantage shaping, 1024 in-flight requests |
+| `math_grpo_minicpm5_2b` / `_4gpu` | MiniCPM5-2B · local S9 math set | 8 cards (or 4); 8×TP1 inference colocated with a CP4 trainer | `None` | 128k context: context parallel, dynamic batching, custom advantage shaping, 1024 in-flight requests |
 
 ### Same services, one knob
 
