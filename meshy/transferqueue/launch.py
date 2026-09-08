@@ -40,7 +40,7 @@ from typing import IO
 
 from meshy.service.base import die_with_parent
 
-_CLI = "tq_rayless.cli"
+_CLI = "meshy.transferqueue.cli"
 
 
 class TransferQueueCluster:

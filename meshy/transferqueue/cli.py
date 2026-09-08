@@ -172,10 +172,10 @@ def info_main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Allow `python -m tq_rayless.cli controller ...` style invocation.
+    # Allow `python -m meshy.transferqueue.cli controller ...` style invocation.
     if len(sys.argv) > 1 and sys.argv[1] in {"controller", "storage", "info"}:
         sub = sys.argv[1]
         rest = sys.argv[2:]
         sys.exit({"controller": controller_main, "storage": storage_main, "info": info_main}[sub](rest))
-    print("Usage: python -m tq_rayless.cli {controller|storage|info} [args...]", file=sys.stderr)
+    print("Usage: python -m meshy.transferqueue.cli {controller|storage|info} [args...]", file=sys.stderr)
     sys.exit(2)
