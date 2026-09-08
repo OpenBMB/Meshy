@@ -7,7 +7,7 @@
 
 </div>
 
-Meshy models every role of an RL run as an
+**Meshy** models every role of an RL run as an
 independent service. Samples flow between services through a single
 TransferQueue data plane, control flow is driven by data availability, and the
 whole topology is derived locally by each process from one declarative recipe.
