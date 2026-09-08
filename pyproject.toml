@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshy"
+version = "0.1.0"
+description = "A minimal GRPO reinforcement-learning trainer over torchtitan + SGLang."
+requires-python = ">=3.12"
+
+# NOTE: torch, torchtitan and sglang are installed manually (see README.md) —
+# torch/torchtitan come from the PyTorch nightly index and are deliberately NOT
+# listed here so that `pip install -e .` does not pull stable wheels and clobber
+# the nightly build. sglang is excluded for the same reason: it would drag its
+# own pinned stable torch in behind it.
+dependencies = [
+    "transformers",
+    "datasets",
+    "fastapi",
+    "httpx",
+    "cloudpickle",
+    "loguru",
+    "tensordict",
+    "pybase64",
+    "huggingface_hub",
+    "sympy",
+    "pylatexenc",
+    "uvicorn",
+    "pyzmq",
+    "hydra-core",
+    "numpy",
+    "msgspec",
+    "psutil",
+    "omegaconf",
+    "prometheus_client>=0.20.0",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+include = ["meshy*"]
