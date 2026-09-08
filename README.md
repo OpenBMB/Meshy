@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/meshy-logo.png" alt="Meshy — Asynchronous RL Engine for LLMs" width="800">
+<img src="assets/meshy-logo.png" alt="Meshy — Asynchronous RL Engine for LLMs" width="400">
 
 
 [![Notion Blog](https://img.shields.io/badge/Notion-000000?style=for-the-badge&logo=notion&logoColor=white)](https://maydomain.notion.site/meshy-blog-en) [![Zhihu](https://img.shields.io/badge/Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white)](https://zhuanlan.zhihu.com/p/2080612686585402867) [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/openBMB/Meshy) [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/ztonyzhao/meshy) [![License](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
