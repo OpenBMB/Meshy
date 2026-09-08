@@ -1,0 +1,61 @@
+ckpts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Training outputs
+outputs/
+checkpoint/
+checkpoints/
+runs/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary / profiling
+profile_traces/
+comm_traces/
+*.prof
+*.json.gz
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Local-only TQ tooling / run artifacts
+transfer_queue_rayless
+tq_endpoints.json
+
+.xrl_runtime/
