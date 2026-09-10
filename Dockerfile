@@ -40,7 +40,7 @@ RUN uv pip install --python "${VIRTUAL_ENV}/bin/python" \
 COPY third_party/torchtitan-0.1.0.dev20260501+cu126-py3-none-any.whl /tmp/torchtitan-0.1.0.dev20260501+cu126-py3-none-any.whl
 
 RUN uv pip install --python "${VIRTUAL_ENV}/bin/python" \
-        pylatexenc \
+        transformers datasets fastapi httpx cloudpickle loguru tensordict pybase64 huggingface_hub sympy pylatexenc uvicorn pyzmq hydra-core numpy msgspec psutil omegaconf "prometheus_client>=0.20.0" \
         --index-url "${PYPI_INDEX_URL}" && \
     uv pip install --python "${VIRTUAL_ENV}/bin/python" \
         /tmp/torchtitan-0.1.0.dev20260501+cu126-py3-none-any.whl \
