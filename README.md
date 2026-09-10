@@ -3,7 +3,7 @@
 <img src="assets/meshy-logo.png" alt="Meshy — Asynchronous RL Engine for LLMs" width="400">
 
 
-[![Notion Blog](https://img.shields.io/badge/Notion-000000?style=for-the-badge&logo=notion&logoColor=white)](https://maydomain.notion.site/meshy-blog-en) [![Zhihu](https://img.shields.io/badge/Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white)](https://zhuanlan.zhihu.com/p/2080612686585402867) [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/openBMB/Meshy) [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/ztonyzhao/meshy) [![License](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Notion Blog](https://img.shields.io/badge/Notion-000000?style=for-the-badge&logo=notion&logoColor=white)](https://maydomain.notion.site/meshy-blog-en) [![Zhihu](https://img.shields.io/badge/Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white)](https://zhuanlan.zhihu.com/p/2080612686585402867) [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/OpenBMB/Meshy) [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/ztonyzhao/meshy) [![License](https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
 
 </div>
 
@@ -25,20 +25,20 @@ Built on SGLang and torchtitan.
 
 - 🗂️ **TransferQueue as both data and control plane.** All communication happens through queue columns; column readiness is the only control signal, so services never handshake directly. Gate pulses, GPU ownership, and tensors themselves travel in the same middleware.
 
-- ⚡ **Native async algorithm support.** Recipe of on-policy, bounded off-policy
-  and fully asynchronous training uses the same set of services with only change
-  of rollout pacing window as a knob.
+- ⚡ **Native async algorithm support.** Recipes for on-policy, bounded
+  off-policy and fully asynchronous training use the same set of services, with
+  only the rollout pacing window as a knob.
 
 - 🧭 **Topology as a pure function.** Full placement is calculated SPMD-style on
-  each machine, without need of service discovery. Misplaced reciped would be
-  identified on startup.
+  each machine, without the need for service discovery. A misplaced recipe is
+  identified at startup.
 
 - 🔄 **Colocation with any number of services.** GPU
-  ownership is a token passed over TransferQueue; developers could freely
-  arrange any amount of services colocating on the same set of GPUs.
+  ownership is a token passed over TransferQueue; developers can freely
+  arrange any number of services colocated on the same set of GPUs.
 
 - 🪶 **Lightweight and debuggable.** Logs are kept one file per service with full
-  tracebacks. When something stalls, the queue tells with piling unconsumed
+  tracebacks. When something stalls, the queue shows it as piled-up unconsumed
   columns.
 
 ## News
@@ -225,7 +225,7 @@ Meshy composes a handful of outstanding open-source projects:
   only data and control plane
 
 Its design is indebted to the pioneering work of
-[verl](https://github.com/volcengine/verl),
+[verl](https://github.com/verl-project/verl),
 [slime](https://github.com/THUDM/slime),
 [miles](https://github.com/radixark/miles) and
 [Relax](https://github.com/redai-infra/Relax).
