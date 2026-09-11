@@ -67,9 +67,11 @@ class _Tokenizer:
     """Rebuild ``tokens / mask_assistant`` from a message list.
 
     Non-assistant turns are tokenized through the chat template exactly like
-    ``SampleBuilder.append_text`` does (template diff with the generation
-    prompt); assistant turns are ``encode(content) + [eos]`` — what the
-    inference engine actually produced, without a trailing generation prompt.
+    ``SampleBuilder.build_sample`` does (template diffs rendered without the
+    generation prompt, so successive renders are true prefixes); before each
+    assistant turn the generation prompt the engine was actually prompted with
+    is appended (mask 0). Assistant turns are ``encode(content) + [eos]`` —
+    what the inference engine actually produced.
     """
 
     def __init__(self, model_path: str) -> None:
@@ -78,8 +80,12 @@ class _Tokenizer:
         self.tok = AutoTokenizer.from_pretrained(model_path)
         self.eos = self.tok.eos_token_id
 
-    def _template(self, messages: list[dict[str, str]]) -> list[int]:
-        out = self.tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    def _template(self, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> list[int]:
+        if not messages:
+            return []
+        out = self.tok.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt
+        )
         # Newer transformers return a BatchEncoding (a UserDict, not a dict).
         return list(out["input_ids"] if hasattr(out, "keys") else out)
 
@@ -87,19 +93,24 @@ class _Tokenizer:
         tokens: list[int] = []
         masks: list[int] = []
         seen: list[dict[str, str]] = []
+        prev: list[int] = []
         for msg in messages:
-            seen.append(msg)
             if msg["role"] == "assistant":
+                # The engine saw the generation prompt before producing this turn.
+                gen = self._template(seen, add_generation_prompt=True)[len(prev):]
+                tokens.extend(gen)
+                masks.extend([0] * len(gen))
                 ids = self.tok.encode(msg["content"], add_special_tokens=False)
                 if self.eos is not None:
                     ids = ids + [self.eos]
+                seen.append(msg)
+                prev = self._template(seen, add_generation_prompt=False)
                 masks.extend([1] * len(ids))
             else:
-                # Tokens the template adds beyond the previous turns (the
-                # first turn is taken whole), mirroring SampleBuilder.append_text.
-                full = self._template(seen)
-                prev = self._template(seen[:-1]) if len(seen) > 1 else []
+                seen.append(msg)
+                full = self._template(seen, add_generation_prompt=False)
                 ids = full[len(prev):]
+                prev = full
                 masks.extend([0] * len(ids))
             tokens.extend(ids)
         return tokens, masks
