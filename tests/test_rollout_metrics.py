@@ -31,7 +31,7 @@ def _sample(
     mask = torch.ones(length)
     mask[:prompt] = 0
     logprobs = -torch.rand(length, generator=g)
-    logprobs[:prompt] = 0.0  # prompt placeholders, like SampleBuilder.append_text
+    logprobs[:prompt] = 0.0  # prompt placeholders, like SampleBuilder.build_sample
     return TensorDict(
         {
             "tokens": torch.randint(1, 1000, (length,), generator=g),

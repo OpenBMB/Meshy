@@ -30,9 +30,39 @@ class SampleBuilder:
     def __init__(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    def _render(self, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> list[int]:
+        if not messages:
+            return []
+        out = self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt
+        )
+        # Some transformers versions return a BatchEncoding (a UserDict), others
+        # a plain list of ids.
+        return list(out["input_ids"] if hasattr(out, "keys") else out)
+
+    def _spans(self, messages: list[dict[str, str]]) -> list[tuple[str | None, list[int]]]:
+        """Split the rendered prompt into per-message ``(role, ids)`` spans.
+
+        Spans are diffed on renders *without* the generation prompt: successive
+        renders are then true prefixes of each other, so slicing by length is
+        exact. (Diffing renders that carry the generation prompt is wrong: the
+        prompt sits at the end of each render, so they are not prefix-related.)
+        The final span is the generation prompt itself, with role ``None``.
+        """
+        spans: list[tuple[str | None, list[int]]] = []
+        prev_ids: list[int] = []
+        for i, msg in enumerate(messages):
+            full_ids = self._render(messages[: i + 1], add_generation_prompt=False)
+            spans.append((msg["role"], full_ids[len(prev_ids):]))
+            prev_ids = full_ids
+        tail = self._render(messages, add_generation_prompt=True)[len(prev_ids):]
+        spans.append((None, tail))
+        return spans
+
     def build_sample(self, messages: Iterable[dict[str, str]], logprob: float = 0.0) -> Sample:
+        messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         sample = Sample(
-            messages=[],
+            messages=messages,
             tokens=[],
             logprobs=[],
             masks=[],
@@ -40,21 +70,10 @@ class SampleBuilder:
             reward=None,
             advantage=None
         )
-        for msg in messages:
-            sample = self.append_text(sample, msg["role"], msg["content"], logprob)
-        return sample
-
-    def append_text(self, sample: Sample, role: str, content: str, logprob: float = 0.0) -> Sample:
-        sample.messages.append({"role": role, "content": content})
-        if len(sample.messages) == 1:
-            ids = self.tokenizer.apply_chat_template(sample.messages, tokenize=True, add_generation_prompt=True)["input_ids"]
-        else:
-            old_ids = self.tokenizer.apply_chat_template(sample.messages[:-1], tokenize=True, add_generation_prompt=True)["input_ids"]
-            new_ids = self.tokenizer.apply_chat_template(sample.messages, tokenize=True, add_generation_prompt=True)["input_ids"]
-            ids = new_ids[len(old_ids):]
-        sample.tokens.extend(ids)
-        sample.logprobs.extend([logprob] * len(ids))
-        sample.masks.extend([1 if role == "assistant" else 0] * len(ids))
+        for role, ids in self._spans(messages):
+            sample.tokens.extend(ids)
+            sample.logprobs.extend([logprob] * len(ids))
+            sample.masks.extend([1 if role == "assistant" else 0] * len(ids))
         return sample
 
     def append_tokens(
