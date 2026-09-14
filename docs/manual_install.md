@@ -34,7 +34,7 @@ This guide sets up Meshy without Docker. Use it if you cannot use the [prebuilt 
 4. **Install SGLang** (pre-release build):
 
    ```bash
-   uv pip install sglang==0.15.8
+   uv pip install sglang==0.5.18
    ```
 
 5. **Install PyTorch with CUDA 12.9**:
