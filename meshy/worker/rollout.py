@@ -49,6 +49,42 @@ def resolve_callable(value: str | Callable[..., Any]) -> Callable[..., Any]:
     return obj
 
 
+#: What a dataset must expose for a run to be resumable. ``RolloutWorker``
+#: rebuilds the dataset per epoch from the same seed, so the permutation is
+#: fixed and a resume only needs to skip forward in it -- but the skip has to
+#: go through the adapter, because how far "prompt N" is into the underlying
+#: records is the adapter's business. ``seek(index)`` is the explicit hook; a
+#: writable integer ``index`` (what every built-in adapter uses) is accepted
+#: as the implicit one.
+_SEEK_HINT = (
+    "a resumable dataset must define seek(index) or expose a writable integer "
+    "``index`` attribute counting prompts consumed (see "
+    "docs/how_to_build_a_recipe.md)"
+)
+
+
+def _require_seekable(dataset: Any) -> None:
+    """Fail at the first epoch, not at the first resume, on a fixed dataset."""
+    if callable(getattr(dataset, "seek", None)) or hasattr(dataset, "index"):
+        return
+    raise TypeError(
+        f"checkpointing is enabled but {type(dataset).__name__} cannot resume: "
+        f"{_SEEK_HINT}"
+    )
+
+
+def _seek_dataset(dataset: Any, index: int) -> None:
+    """Advance ``dataset`` to the prompt cursor a checkpoint recorded."""
+    seek = getattr(dataset, "seek", None)
+    if callable(seek):
+        seek(int(index))
+        return
+    if hasattr(dataset, "index"):
+        dataset.index = int(index)
+        return
+    raise TypeError(f"cannot resume {type(dataset).__name__}: {_SEEK_HINT}")
+
+
 def grpo_advantage(samples: list[Any]) -> None:
     import torch
 
@@ -201,6 +237,10 @@ class RolloutWorker(TQWorker):
         trajectory_log: str | None = None,
         verbose_trajectory_log: bool = False,
         external_advantage: bool = False,
+        checkpoint: Any = None,
+        resume_step: int = 0,
+        state_dir: str | None = None,
+        service_name: str = "rollout",
         client_factory=None,
         colocation: ColocationManager | None = None,
     ) -> None:
@@ -268,6 +308,25 @@ class RolloutWorker(TQWorker):
         self.gates_seen = 0
         self.weight_version = 0
         self.samples_started = 0
+        # ── resumable data position ──────────────────────────────────────
+        from meshy.config import GlobalCheckpointConfig
+
+        self.checkpoint = GlobalCheckpointConfig.coerce(checkpoint)
+        self.resume_step = int(resume_step)
+        self.service_name = service_name
+        self._state_dir = state_dir
+        self._store = None
+        #: Where the dataset cursor stands, mirrored onto the Worker so a
+        #: snapshot taken from the gate loop can see it. ``_dataset_index``
+        #: counts prompts *pulled off the dataset*, not prompts trained on, so
+        #: a resume skips rather than replays: the groups still generating at
+        #: the checkpoint, plus any tail of the current dataset batch not yet
+        #: dispatched. Skipping keeps a resumed run from training twice on the
+        #: same prompt, which duplicating would do to every one of them.
+        self._epoch = 0
+        self._dataset_index = 0
+        self._filtered_at_epoch_start = 0
+        self._restore()
         self.trajectory_logger = (
             TrajectoryLogger(trajectory_log, verbose=verbose_trajectory_log)
             if trajectory_log
@@ -311,6 +370,91 @@ class RolloutWorker(TQWorker):
         finally:
             await self.close_tq()
 
+    # ── global checkpoint ────────────────────────────────────────────────
+    @property
+    def store(self):
+        """Lazily-built :class:`~meshy.service.checkpoint.StateStore`."""
+        if self._store is None:
+            from meshy.service.checkpoint import StateStore
+
+            if not self._state_dir:
+                raise RuntimeError(
+                    "RolloutWorker checkpointing needs a state_dir; the Service "
+                    "did not wire one"
+                )
+            self._store = StateStore(self._state_dir)
+        return self._store
+
+    def _restore(self) -> None:
+        """Re-seed the data position and the pacing counters from a shard.
+
+        ``gates_seen`` is deliberately restored to ``resume_step`` rather than
+        the ``resume_step + 1`` the snapshot recorded. TransferQueue is
+        RAM-only, so a resumed run's ``gen_gate`` partition starts empty and
+        the trainer re-publishes a genesis pulse *at* ``resume_step`` to
+        re-establish the stream. Setting the counter one lower is what makes
+        this worker expect exactly that pulse, keeping
+        :meth:`try_advance_gate`'s ordering check satisfied and re-granting
+        the last window's sample budget exactly once.
+        """
+        from meshy.service.checkpoint import log_resume
+
+        if self.resume_step <= 0:
+            return
+        payload = self.store.payload(self.service_name, self.resume_step)
+        if not payload:
+            raise FileNotFoundError(
+                f"resuming at global step {self.resume_step} but "
+                f"{self.store.meta_path(self.service_name, self.resume_step)} "
+                "is missing; the shard is incomplete"
+            )
+        self._epoch = int(payload["epoch"])
+        self._dataset_index = int(payload["dataset_index"])
+        self._filtered_at_epoch_start = int(payload["filtered_at_epoch_start"])
+        self.groups_seen = int(payload["groups_seen"])
+        self.groups_filtered = int(payload["groups_filtered"])
+        self.samples_started = int(payload["samples_started"])
+        self.weight_version = int(payload["weight_version"])
+        self.gates_seen = self.resume_step
+        log_resume(
+            self.service_name,
+            self.resume_step,
+            f"epoch={self._epoch} dataset_index={self._dataset_index} "
+            f"samples_started={self.samples_started} v{self.weight_version}",
+        )
+
+    def _snapshot(self, global_step: int) -> None:
+        """Commit the rollout's shard for ``global_step``.
+
+        Called from the gate loop, which is the rollout's only point of
+        contact with the run's clock -- and the right one: gate ``N`` is
+        published by the trainer *after* its step ``N`` is durable, so a
+        rollout shard stamped ``N`` can never describe a window the trainer
+        has not finished.
+        """
+        self.store.write_meta(
+            self.service_name,
+            global_step,
+            {
+                "epoch": self._epoch,
+                "dataset_index": self._dataset_index,
+                "filtered_at_epoch_start": self._filtered_at_epoch_start,
+                "groups_seen": self.groups_seen,
+                "groups_filtered": self.groups_filtered,
+                "gates_seen": self.gates_seen,
+                "samples_started": self.samples_started,
+                "weight_version": self.weight_version,
+            },
+        )
+        self.store.mark_complete(self.service_name, global_step)
+        self.store.prune(self.service_name, self.checkpoint.keep_latest_k)
+        logger.info(
+            "RolloutWorker checkpointed global step {} (epoch {}, prompt {})",
+            global_step,
+            self._epoch,
+            self._dataset_index,
+        )
+
     def _generation_budget(self) -> int:
         if self.gates_seen == 0:
             return 0
@@ -341,6 +485,12 @@ class RolloutWorker(TQWorker):
             version,
             self.samples_started,
         )
+        # The gate step *is* the run's global window index, so this is where
+        # the rollout learns a checkpoint boundary has passed. Re-consuming
+        # the resume pulse must not re-snapshot on top of the shard it was
+        # restored from, hence the ``>`` rather than a bare ``due()``.
+        if self.checkpoint.due(step) and step > self.resume_step:
+            self._snapshot(step)
         return True
 
     async def drain_gates(self) -> None:
@@ -508,14 +658,38 @@ class RolloutWorker(TQWorker):
                 if semaphore is not None:
                     semaphore.release()
 
-        for epoch in range(self.num_epochs):
+        # A resumed run re-enters the epoch it stopped in and skips forward to
+        # the prompt it had reached. It must *not* reshuffle with an
+        # epoch-derived seed: the dataset is rebuilt from the same seed each
+        # epoch, so the permutation is fixed, and seeking into it is the only
+        # way a resumed run stays on the original data order.
+        resuming = self.resume_step > 0
+        for epoch in range(self._epoch, self.num_epochs):
             if self.stopped:
                 break
+            self._epoch = epoch
             dataset = self.dataset_factory(**self.dataset_kwargs)
+            if self.checkpoint.enabled:
+                _require_seekable(dataset)
+            if resuming:
+                _seek_dataset(dataset, self._dataset_index)
+                logger.info(
+                    "RolloutWorker: epoch {} fast-forwarded to prompt {}; the "
+                    "groups in flight at the checkpoint are skipped, not replayed",
+                    epoch,
+                    self._dataset_index,
+                )
+            else:
+                self._dataset_index = 0
+                self._filtered_at_epoch_start = self.groups_filtered
+            resuming = False
             budget = self._oversample_budget(getattr(dataset, "n_prompts", None))
-            filtered_at_epoch_start = self.groups_filtered
+            filtered_at_epoch_start = self._filtered_at_epoch_start
             while not self.stopped:
                 prompts = dataset.next_batch(builder)
+                self._dataset_index = int(
+                    getattr(dataset, "index", self._dataset_index + len(prompts))
+                )
                 if not prompts:
                     logger.info(
                         "RolloutWorker dataset exhausted (epoch {}); {} of {} groups "

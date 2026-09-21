@@ -43,7 +43,9 @@ class TitanTrainingService(SpmdService):
         colocate_inference_by_rank: dict[int, str] | None = None,
         inference_targets: list[dict[str, Any]] | None = None,
         weight_sync_mode: str = "auto",
-        hf_save_interval: int = 0,
+        weights_keep_latest_k: int = 0,
+        checkpoint: Any = None,
+        resume_step: int = 0,
         model_path: str,
         trainer_config: Any,
         trainer_params: Any = None,
@@ -73,7 +75,9 @@ class TitanTrainingService(SpmdService):
         self.colocate_inference_by_rank = colocate_inference_by_rank or {}
         self.inference_targets = inference_targets or []
         self.weight_sync_mode = weight_sync_mode
-        self.hf_save_interval = hf_save_interval
+        self.weights_keep_latest_k = int(weights_keep_latest_k)
+        self.checkpoint = checkpoint
+        self.resume_step = int(resume_step)
         self.model_path = model_path
         self.trainer_config = trainer_config
         self.trainer_params = trainer_params
@@ -95,6 +99,7 @@ class TitanTrainingService(SpmdService):
         runtime: RuntimeDir,
     ) -> "TitanTrainingService":
         from meshy.config import TrainingServiceConfig
+        from meshy.service.checkpoint import run_resume_step
         from meshy.transferqueue.client import resolve_endpoints_file
 
         config = info.config
@@ -115,7 +120,9 @@ class TitanTrainingService(SpmdService):
             colocate_inference_by_rank=by_rank,
             inference_targets=topology.inference_targets(),
             weight_sync_mode=str(config.weight_sync_mode),
-            hf_save_interval=int(config.hf_save_interval),
+            weights_keep_latest_k=int(config.weights_keep_latest_k),
+            checkpoint=config.checkpoint,
+            resume_step=run_resume_step(topology, runtime),
             model_path=config.model_path,
             trainer_config=config.trainer_config,
             trainer_params=config.trainer_params,
@@ -155,7 +162,10 @@ class TitanTrainingService(SpmdService):
             inference_targets=self.inference_targets,
             managed_inference_names=self.colocate_inference_names,
             weight_sync_mode="disk" if self.weight_sync_mode == "auto" else self.weight_sync_mode,
-            hf_save_interval=self.hf_save_interval,
+            weights_keep_latest_k=self.weights_keep_latest_k,
+            checkpoint=self.checkpoint,
+            gate_step_offset=self.critic_cold_start_windows,
+            resume_step=self.resume_step,
         )
 
     def build_worker(self, engine: "TitanEngine", colocation) -> "TitanWorker":
@@ -177,4 +187,5 @@ class TitanTrainingService(SpmdService):
             poll_interval=self.tq_poll_interval,
             colocation=colocation,
             gate_step_offset=self.critic_cold_start_windows,
+            resume_step=self.resume_step,
         )

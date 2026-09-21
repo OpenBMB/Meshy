@@ -45,6 +45,7 @@ import os
 from pathlib import Path
 
 from meshy.config import (
+    GlobalCheckpointConfig,
     CriticServiceConfig,
     InferenceServiceConfig,
     RolloutServiceConfig,
@@ -92,6 +93,16 @@ NUM_STEPS = 600
 #: the cold-start -> publish transition quickly.
 COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "30"))
 CRITIC_SCORE_BATCH = int(os.environ.get("XRL_CRITIC_SCORE_BATCH", str(BATCH_SIZE)))
+
+#: §3's "ckpt every 10 steps, rotated". One instance shared by the trainer,
+#: the critic and the rollout -- the resume point is the newest window all
+#: three committed a shard for. Resume with ``--runtime-dir <old run>
+#: --resume``; see ``meshy/service/checkpoint.py``.
+CHECKPOINT = GlobalCheckpointConfig(
+    enabled=os.environ.get("XRL_CHECKPOINT", "1") not in ("0", "false", ""),
+    interval=int(os.environ.get("XRL_CHECKPOINT_INTERVAL", "10")),
+    keep_latest_k=int(os.environ.get("XRL_CHECKPOINT_KEEP", "3")),
+)
 
 
 def _validate_dataset() -> None:
@@ -214,6 +225,7 @@ def _training_group() -> ServiceGroup:
             timer_enabled=True,
             # Keeps the rollout gate monotonic across the cold-start hand-off.
             critic_cold_start_windows=COLD_START_WINDOWS,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -250,6 +262,7 @@ def _critic_group() -> ServiceGroup:
             # half-life to ~500 tokens and causes entropy collapse at step ~55.
             alpha=1.5,
             max_norm=1.0,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -276,6 +289,7 @@ def _rollout_group() -> ServiceGroup:
             # PPO+critic gives zero-variance groups a gradient (§1), so there
             # is no reason to drop them.
             filter_zero_std_groups=False,
+            checkpoint=CHECKPOINT,
         ),
     )
 

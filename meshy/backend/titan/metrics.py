@@ -420,6 +420,11 @@ class TitanTrainer(_BackendTitanTrainer):
 
     def close(self) -> None:
         self._tensorboard.close()
+        # This class is what ``TitanEngine`` actually instantiates, so without
+        # the chained call ``ForgeEngine.close()`` -- and with it
+        # ``CheckpointManager.close()`` -- never runs, leaking the checkpointer's
+        # purge thread and async stager.
+        super().close()
 
 
 __all__ = ["HISTOGRAM_PREFIX", "TitanTrainer", "build_forge_config"]

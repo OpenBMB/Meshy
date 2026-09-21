@@ -95,6 +95,41 @@ class _Subprocess:
             self._process.terminate()
 
 
+def _boot_model_path(
+    configured: str | None, topology: "Topology", runtime: RuntimeDir
+) -> str | None:
+    """Weights a resumed inference server must boot with.
+
+    The genesis GPU grant carries no ``payload_ref``, so
+    ``SGLangEngine.on_colocate_acquire`` falls back to ``model_path`` -- the
+    *base* model. On a fresh run that is right; on a resume it would serve the
+    pre-training policy for a whole window while the trainer believes it is
+    generating on ``v{N}``, and nothing downstream would flag it. Point the
+    server at the actor's last exported checkpoint instead.
+
+    Unchanged when the actor never stepped (a resume inside the critic's cold
+    start), which is exactly when the base model *is* the current policy.
+    """
+    from meshy.service.checkpoint import run_resume_step
+
+    step = run_resume_step(topology, runtime)
+    if step <= 0:
+        return configured
+    store = runtime.state_store()
+    for trainer in topology.training_services():
+        weights = store.payload(trainer.name, step).get("weights_path")
+        if weights and os.path.isdir(weights):
+            logger.info(
+                "Resume: inference boots from {} (actor {} at global step {}) "
+                "instead of the base model",
+                weights,
+                trainer.name,
+                step,
+            )
+            return weights
+    return configured
+
+
 class SGLangService(Service):
     """Placement and lifecycle wrapper around one SGLang replica."""
 
@@ -165,16 +200,25 @@ class SGLangService(Service):
                 f"inference service {info.name!r} needs InferenceServiceConfig, "
                 f"got {type(config).__name__}"
             )
+        boot_path = _boot_model_path(config.model_path, topology, runtime)
+        server_args = dict(config.server_args)
+        if boot_path is not None and boot_path != config.model_path:
+            # Recipes usually set ``server_args["model_path"]`` too, and
+            # ``ignite`` only *setdefault*s over it -- so without this the
+            # server process would still boot the base model. A colocated
+            # replica would recover on its genesis grant, but a disaggregated
+            # one has nothing to correct it until the trainer's first step.
+            server_args["model_path"] = boot_path
         return cls(
             name=info.name,
             my_gpu=my_gpu,
             replica_gpus=info.replica_gpus,
-            server_args=dict(config.server_args),
+            server_args=server_args,
             endpoint_port=info.endpoint_port,
             dist_port=info.dist_port,
             is_colocate=info.is_colocate,
             group_endpoints=[member.endpoint for member in topology.group(info.group_id)],
-            model_path=config.model_path,
+            model_path=boot_path,
             runtime=runtime,
         )
 

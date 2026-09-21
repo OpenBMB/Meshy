@@ -25,7 +25,7 @@ Recipe conformance (``justrl_ii_recipe.md``):
 | dynamic sampling + 2× oversample | on | `filter_zero_std_groups` (off, see there) |
 | positive_lm_loss | 0.1 | **absent** |
 | in-loop eval | every 5 steps, AIME ×3 ×4 | **absent -- read this first** |
-| ckpt | every 10 steps, rotated | **absent**, see §"Disk" |
+| ckpt | every 10 steps, rotated | `CHECKPOINT`, see §"Disk" |
 | partial rollout | on | on, via SGLang abort/continue |
 
 Where each piece of the VAPO advantage runs
@@ -127,14 +127,22 @@ identical.
 Disk
 ----
 
-`enable_checkpoint=True` does **not** produce periodic training checkpoints
-here: `TitanTrainer.save_checkpoint` (DCP) has no caller in the RL loop and
-`hf_save_interval` is plumbed but unused. What actually lands on disk is the
-colocation weight-sync export — a full 2.25B HF checkpoint written to
-`checkpoints/actor_train/v{N}/` **every step**, with no rotation anywhere in
-the tree. Over 296 steps that is terabytes; §5 notes production jobs dying of
-"临时存储超限". Size the scratch volume or prune `v{N}` out of band before
-starting a long run.
+Two independent things land on disk, on two budgets.
+
+`CHECKPOINT` is the resumable one: every `interval` windows the actor writes a
+DCP shard (model + optimizer + LR schedule + step), the critic writes its value
+net + AdamW, and the rollout writes its data cursor, all under
+`{runtime}/state/{service}/step-{N}/`. A run continues from the newest step all
+three reached — see `meshy/service/checkpoint.py`. At fp32 that is ~27 GB per
+replica, so ~54 GB per retained step and ~160 GB at `keep_latest_k=3`.
+
+The other is the colocation weight-sync export — a full 2.25B HF checkpoint
+written to `weights/actor_train-0/v{N}/` **every step**, because that is how
+SGLang reloads the policy. It used to have no rotation anywhere in the tree;
+over 296 steps that is terabytes, and §5 notes production jobs dying of
+"临时存储超限". `TrainingServiceConfig.weights_keep_latest_k` now prunes it,
+keeping the newest few plus any version a retained global checkpoint still
+points at (a resumed inference server boots from exactly that path).
 
 Not implemented
 ---------------
@@ -146,12 +154,17 @@ Not implemented
   degradation is invisible to every training-side metric, so the peak ckpt can
   only be selected by in-loop eval. There is no eval role in `meshy/service/`,
   so this run produces no basis for choosing a checkpoint.
-- **positive_lm_loss**, **critic checkpointing** (a crash loses the value net)
-  and the three §2 gauges as dashboard metrics (they are loguru-only) are all
-  absent.
+- **positive_lm_loss** and the three §2 gauges as dashboard metrics (they are
+  loguru-only) are absent.
 - **dynamic sampling** is implemented but off here; see
   `filter_zero_std_groups` in `_rollout_group` for why that is a choice rather
   than a gap.
+
+What a resume does *not* recover: TransferQueue is RAM-only, so every row in
+flight at the checkpoint is lost, and the rollout restarts from the prompt
+cursor it had already handed out. Up to one pacing window of prompts is
+therefore skipped rather than replayed — deliberate, so a resumed run never
+trains twice on the same prompt.
 
 See ``docs/critic_engine.md`` §4.
 
@@ -170,6 +183,7 @@ import os
 from pathlib import Path
 
 from meshy.config import (
+    GlobalCheckpointConfig,
     GAE_TRAINER_FIELDS_SHAPED,
     CriticServiceConfig,
     InferenceServiceConfig,
@@ -231,6 +245,26 @@ NUM_STEPS = 600
 #: cold-start -> publish transition can be reached quickly in a smoke run.
 COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "20"))
 CRITIC_SCORE_BATCH = int(os.environ.get("XRL_CRITIC_SCORE_BATCH", str(BATCH_SIZE)))
+
+#: §3's "ckpt every 10 steps, rotated". The *same* instance goes to the
+#: trainer, the critic and the rollout: the resume point is the newest window
+#: all three committed a shard for, so a service on its own interval would
+#: never intersect (``build_topology`` rejects that).
+#:
+#: Cost at ``dtype="float32"``: ~9 GB of parameters plus ~18 GB of AdamW
+#: moments per replica, actor and critic both, so roughly 54 GB per retained
+#: step -- ~160 GB resident at ``keep_latest_k=3``. That is on top of the
+#: exported HF weights, which now rotate too (see "Disk" above).
+#:
+#: Resume with::
+#:
+#:     python scripts/launch.py --recipe recipe.justrl_ii_minicpm5_2b_128k \\
+#:         --runtime-dir <the interrupted run's dir> --resume
+CHECKPOINT = GlobalCheckpointConfig(
+    enabled=os.environ.get("XRL_CHECKPOINT", "1") not in ("0", "false", ""),
+    interval=int(os.environ.get("XRL_CHECKPOINT_INTERVAL", "10")),
+    keep_latest_k=int(os.environ.get("XRL_CHECKPOINT_KEEP", "3")),
+)
 
 
 def _validate_dataset() -> None:
@@ -430,6 +464,7 @@ def _training_group() -> ServiceGroup:
             # Keeps the rollout's gate stream monotonic across the hand-off
             # from the critic (which paces during cold start) to the trainer.
             critic_cold_start_windows=COLD_START_WINDOWS,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -497,6 +532,7 @@ def _critic_group() -> ServiceGroup:
             # `gae_alpha` is what governs the live advantage.
             alpha=1.5,
             max_norm=1.0,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -574,6 +610,7 @@ def _rollout_group() -> ServiceGroup:
             # uniformly-solved prompts from burning the dataset.
             filter_zero_std_groups=False,
             oversample_factor=2.0,
+            checkpoint=CHECKPOINT,
         ),
     )
 

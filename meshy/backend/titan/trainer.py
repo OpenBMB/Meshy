@@ -141,6 +141,14 @@ class TitanTrainer(ForgeEngine):
         apply_forge_engine_compat(job_config)
         super().__init__(job_config)
 
+        # ``ForgeEngine`` has no dataloader and hard-codes ``dataloader=None``
+        # into the checkpointer's state map. That entry is harmless while the
+        # only load is model-only (torchtitan's own pretraining path), but a
+        # full save flattens ``states`` straight into ``dcp.save`` and a bare
+        # ``None`` is not a Stateful. RL owns its data position in the rollout
+        # (:mod:`meshy.worker.rollout`), so drop the slot rather than fill it.
+        self.checkpointer.states.pop("dataloader", None)
+
         self.step = 0
         self.seq_len = self.config.training.seq_len
         self.micro_batch_size = max(1, micro_batch_size)
@@ -1010,9 +1018,16 @@ class TitanTrainer(ForgeEngine):
     # Checkpoint & weight sync helpers
     # ------------------------------------------------------------------
 
-    def save_checkpoint(self, last_step: bool = False) -> None:
-        """Persist a DCP checkpoint at the current step."""
-        self.checkpointer.save(self.step, last_step=last_step)
+    def save_checkpoint(self, step: int | None = None, last_step: bool = False) -> None:
+        """Persist a DCP checkpoint (model + optimizer + LR + ``self.step``).
+
+        ``step`` names the checkpoint directory and defaults to this trainer's
+        own optimiser step. RL callers pass the run's **global** window index
+        instead, so the shard lines up with the critic's and the rollout's --
+        the two counters differ by the critic's cold start, and under
+        ``stream_minibatch`` they can differ further.
+        """
+        self.checkpointer.save(int(self.step if step is None else step), last_step=last_step)
 
     def save_hf_checkpoint(self, output_dir: str) -> None:
         """Export current weights to a HuggingFace-format directory.

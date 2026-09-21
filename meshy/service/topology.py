@@ -127,6 +127,56 @@ class Topology:
         trainers = self.training_services()
         return trainers[0].endpoint if trainers else None
 
+    # ── global checkpoint participation ──────────────────────────────────
+    def checkpointing_services(self) -> list[ServiceInfo]:
+        """Every replica that persists a global-checkpoint shard."""
+        return [
+            s
+            for s in self.services
+            if getattr(getattr(s, "config", None), "checkpoint", None) is not None
+            and s.config.checkpoint.enabled
+        ]
+
+    def checkpoint_config(self):
+        """The run's shared checkpoint policy, or ``None`` when disabled.
+
+        ``build_topology`` has already rejected any recipe whose services
+        disagree, so the first enabled service speaks for all of them.
+        """
+        enabled = self.checkpointing_services()
+        return enabled[0].config.checkpoint if enabled else None
+
+    def cold_start_windows(self) -> int:
+        """Windows the critic consumes alone before the actor ever steps.
+
+        ``-1`` means the critic never hands over (the actor never steps at
+        all). 0 when there is no critic.
+        """
+        for service in self.services_by_role("critic"):
+            return int(getattr(service.config, "cold_start_windows", 0))
+        return 0
+
+    def checkpoint_participants(self, step: int) -> tuple[str, ...]:
+        """Services that must have committed a shard for ``step`` to be resumable.
+
+        A pure function of the recipe, so every process derives the same answer
+        from the same static config -- that is what lets the resume point be an
+        agreed-upon intersection with no coordinator.
+
+        Training is *conditional*: during the critic's cold start the trainer's
+        TQ fetch never matches, so it takes no step and writes no shard. Asking
+        for one would make every cold-start step unresumable, which is exactly
+        the phase whose loss hurts most (it is 20-30 windows of critic training
+        with nothing else to show for it).
+        """
+        cold = self.cold_start_windows()
+        names: list[str] = []
+        for service in self.checkpointing_services():
+            if service.role == "training" and (cold < 0 or int(step) <= cold):
+                continue
+            names.append(service.name)
+        return tuple(names)
+
     # ── readiness dependencies ───────────────────────────────────────────
     def dependency_names(self, service: ServiceInfo) -> list[str]:
         """Names of every service in ``service``'s ``wait_until`` groups."""
@@ -285,7 +335,66 @@ def build_topology(
     _attach_colocations(services, colocations or [])
     _validate_ports(services)
     _validate_critic_columns(services)
+    _validate_checkpoint(services)
     return Topology(services)
+
+
+def _validate_checkpoint(services: list[ServiceInfo]) -> None:
+    """Reject checkpoint settings that could never produce a resume point.
+
+    The resume point is the newest step at which *every* participant committed
+    a shard. Two services on different intervals therefore intersect only at
+    their LCM -- or never -- and the failure mode is silent: every service logs
+    healthy saves and ``--resume`` just starts from scratch. Catch it here.
+    """
+    enabled = [
+        s
+        for s in services
+        if getattr(getattr(s, "config", None), "checkpoint", None) is not None
+        and s.config.checkpoint.enabled
+    ]
+    if not enabled:
+        return
+
+    policies = {s.name: s.config.checkpoint for s in enabled}
+    distinct = set(policies.values())
+    if len(distinct) != 1:
+        raise ValueError(
+            "every checkpointing service must share one GlobalCheckpointConfig "
+            "(the resume point is an intersection over their shards), but got: "
+            + ", ".join(f"{name}={policy}" for name, policy in sorted(policies.items()))
+        )
+
+    # A role that never writes a shard can never be restored, and the run would
+    # silently resume with, say, a fresh critic against a resumed actor.
+    roles = {s.role for s in enabled}
+    present = {s.role for s in services}
+    for role in ("training", "critic", "rollout"):
+        if role in present and role not in roles:
+            raise ValueError(
+                f"checkpointing is enabled but the {role!r} service does not "
+                "carry the same GlobalCheckpointConfig; a resumed run would "
+                f"restore every other role and reset {role!r}. Pass the shared "
+                "config to every service in the recipe."
+            )
+
+    # The trainer's gate offset and the critic's cold start are two halves of
+    # one gate stream, and the resume point's participant set is derived from
+    # them. A mismatch makes the two disagree about which steps the trainer was
+    # even running for.
+    critics = [s for s in services if s.role == "critic"]
+    trainers = [s for s in services if s.role == "training"]
+    for critic in critics:
+        cold = int(getattr(critic.config, "cold_start_windows", 0))
+        for trainer in trainers:
+            offset = int(getattr(trainer.config, "critic_cold_start_windows", 0))
+            if offset != cold:
+                raise ValueError(
+                    f"critic {critic.name!r} has cold_start_windows={cold} but "
+                    f"trainer {trainer.name!r} has critic_cold_start_windows="
+                    f"{offset}. They number one shared gate stream and define "
+                    "which steps a resume expects a trainer shard at; they must match."
+                )
 
 
 def _validate_critic_columns(services: list[ServiceInfo]) -> None:

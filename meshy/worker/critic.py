@@ -68,6 +68,7 @@ class CriticWorker(TQWorker):
         poll_interval: float = 0.5,
         colocation: Any = None,
         actor_weights: Callable[[int], str | None] | None = None,
+        resume_step: int = 0,
         client_factory=None,
     ) -> None:
         super().__init__()
@@ -93,10 +94,19 @@ class CriticWorker(TQWorker):
         self.actor_weights = actor_weights
         self.cold_start_windows = int(cold_start_windows)
         self.publish_gate_zero = bool(publish_gate_zero)
-        self.windows = 0
+        #: Windows consumed, and the run's global clock: it counts from the
+        #: first window, cold start included, which is exactly the gate step
+        #: the trainer's ``gate_step_offset`` is defined against. Restoring it
+        #: is load-bearing beyond bookkeeping -- :meth:`should_clear_batch`
+        #: reads it to decide whether a window's rows are the critic's to drop
+        #: or the trainer's to consume, so a reset counter makes the critic
+        #: swallow rows the actor should have trained on.
+        self.windows = int(resume_step)
         #: gates raised during cold start; the trainer resumes numbering above
-        #: this via ``TitanWorker.gate_step_offset``.
-        self.gates_raised = 0
+        #: this via ``TitanWorker.gate_step_offset``. On resume the trainer's
+        #: genesis pulse re-establishes the stream at ``resume_step``, so the
+        #: next cold-start gate this worker raises must be the one after it.
+        self.gates_raised = int(resume_step)
         self.configure_tq(
             endpoints_ref=endpoints_ref,
             input=TQInput(
@@ -154,7 +164,9 @@ class CriticWorker(TQWorker):
             )
             self.colocation.wait_for_grant(request)
         try:
-            result = self.engine.score_and_train(samples, publish=not cold)
+            result = self.engine.score_and_train(
+                samples, publish=not cold, global_step=self.windows
+            )
         finally:
             if request is not None:
                 # The next ring member is the trainer, but it cannot have asked

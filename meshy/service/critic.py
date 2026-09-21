@@ -57,6 +57,8 @@ class CriticService(SpmdService):
         publish_gate_zero: bool = False,
         actor_name: str | None = None,
         actor_model_path: str | None = None,
+        checkpoint: Any = None,
+        resume_step: int = 0,
     ) -> None:
         super().__init__(
             name=name, role="critic", my_gpu=my_gpu, replica_gpus=replica_gpus,
@@ -84,6 +86,8 @@ class CriticService(SpmdService):
         self.tq_poll_interval = tq_poll_interval
         self.actor_name = actor_name
         self.actor_model_path = actor_model_path
+        self.checkpoint = checkpoint
+        self.resume_step = int(resume_step)
 
     @classmethod
     def from_info(
@@ -92,6 +96,7 @@ class CriticService(SpmdService):
         from meshy.transferqueue.client import resolve_endpoints_file
 
         from meshy.config import CriticServiceConfig
+        from meshy.service.checkpoint import run_resume_step
 
         config = info.config
         assert isinstance(config, CriticServiceConfig), (
@@ -137,6 +142,8 @@ class CriticService(SpmdService):
             tq_poll_interval=float(config.tq_poll_interval),
             actor_name=actor.name if actor else None,
             actor_model_path=getattr(actor.config, "model_path", None) if actor else None,
+            checkpoint=config.checkpoint,
+            resume_step=run_resume_step(topology, runtime),
         )
 
     def _actor_weights(self, version: int) -> str | None:
@@ -180,6 +187,8 @@ class CriticService(SpmdService):
             max_tokens_per_micro=self.max_tokens_per_micro,
             publish_mode=self.publish_mode,
             is_colocate=self.is_colocate,
+            checkpoint=self.checkpoint,
+            resume_step=self.resume_step,
         )
 
     def build_worker(self, engine, colocation):
@@ -196,6 +205,7 @@ class CriticService(SpmdService):
             poll_interval=self.tq_poll_interval,
             colocation=colocation,
             actor_weights=self._actor_weights if self.is_colocate else None,
+            resume_step=self.resume_step,
         )
 
 

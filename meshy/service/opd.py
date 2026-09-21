@@ -64,7 +64,10 @@ class OPDTrainingService(TitanTrainingService):
             inference_targets=self.inference_targets,
             managed_inference_names=self.colocate_inference_names,
             weight_sync_mode="disk" if self.weight_sync_mode == "auto" else self.weight_sync_mode,
-            hf_save_interval=self.hf_save_interval,
+            weights_keep_latest_k=self.weights_keep_latest_k,
+            checkpoint=self.checkpoint,
+            gate_step_offset=self.critic_cold_start_windows,
+            resume_step=self.resume_step,
         )
 
 

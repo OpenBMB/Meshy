@@ -36,6 +36,7 @@ class TitanWorker(TQWorker):
         client_factory=None,
         colocation: ColocationManager | None = None,
         gate_step_offset: int = 0,
+        resume_step: int = 0,
     ) -> None:
         super().__init__()
         if not tq_fields:
@@ -49,6 +50,8 @@ class TitanWorker(TQWorker):
         # ``1..N``, so the trainer resumes numbering above them and the gate
         # stream the rollout reads stays monotonic across the hand-off.
         self.gate_step_offset = int(gate_step_offset)
+        #: Global window index a resumed run re-establishes the gate stream at.
+        self._resume_step = int(resume_step)
         self.engine = engine
         self.colocation = colocation
         self._colocation_request = None
@@ -61,6 +64,10 @@ class TitanWorker(TQWorker):
             if stream_minibatch is None
             else stream_minibatch
         )
+        # Nothing to restore on resume: a global checkpoint is only ever taken
+        # on a ``sync`` step, where this counter has just been zeroed, so a
+        # resumed worker always starts a window cleanly rather than
+        # mid-accumulation.
         self.trained_since_sync = 0
         gen_gate_fields = ("gate_step", "weight_version")
         gen_gate_partition = "gen_gate"
@@ -92,7 +99,14 @@ class TitanWorker(TQWorker):
         # The genesis gate establishes the version inference may generate
         # against. It precedes any critic cold-start gate, so it is never
         # offset -- the rollout must see step 0 first.
-        return self._gate_output(step=self._current_version(), offset=0)
+        #
+        # A resumed run starts with an empty ``gen_gate`` partition (TQ is
+        # RAM-only and dies with the launcher), so the same pulse has to
+        # re-establish the stream *at the step the run reached*. The rollout
+        # restores ``gates_seen`` to that step and so expects exactly this
+        # gate; numbering it 0 again would rewind every consumer's budget.
+        step = self._resume_step if self._resume_step > 0 else self._current_version()
+        return self._gate_output(step=step, offset=0)
 
     def _current_version(self) -> int:
         return int(getattr(self.engine, "weight_version", getattr(self.engine, "step_index", 0)))

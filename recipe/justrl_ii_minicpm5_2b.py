@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 
 from meshy.config import (
+    GlobalCheckpointConfig,
     CriticServiceConfig,
     InferenceServiceConfig,
     RolloutServiceConfig,
@@ -73,6 +74,25 @@ MAX_NEW_TOKENS = 1024
 COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "2"))
 #: Rows per critic window. Matches the trainer's batch so the two stay in step.
 CRITIC_SCORE_BATCH = BATCH_SIZE
+
+#: Global checkpoint / resume. The *same* instance goes to the trainer, the
+#: critic and the rollout: the resume point is the newest window all three
+#: committed a shard for, so a service on its own interval would never
+#: intersect (``build_topology`` rejects that).
+#:
+#: Cost at ``dtype="float32"``: ~9 GB of parameters plus ~18 GB of AdamW
+#: moments per replica, actor and critic both, so roughly 54 GB per retained
+#: step. Size the volume for ``keep_latest_k`` of those.
+#:
+#: Resume with::
+#:
+#:     python scripts/launch.py --recipe recipe.justrl_ii_minicpm5_2b \\
+#:         --runtime-dir <the interrupted run's dir> --resume
+CHECKPOINT = GlobalCheckpointConfig(
+    enabled=os.environ.get("XRL_CHECKPOINT", "1") not in ("0", "false", ""),
+    interval=int(os.environ.get("XRL_CHECKPOINT_INTERVAL", "10")),
+    keep_latest_k=int(os.environ.get("XRL_CHECKPOINT_KEEP", "3")),
+)
 
 
 def _sampling_params() -> SamplingParams:
@@ -178,6 +198,7 @@ def _training_group() -> ServiceGroup:
             # Keeps the rollout's gate stream monotonic across the hand-off
             # from the critic (which paces during cold start) to the trainer.
             critic_cold_start_windows=COLD_START_WINDOWS,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -210,6 +231,7 @@ def _critic_group() -> ServiceGroup:
             gamma=1.0,
             alpha=1.5,
             max_norm=1.0,
+            checkpoint=CHECKPOINT,
         ),
     )
 
@@ -236,6 +258,7 @@ def _rollout_group() -> ServiceGroup:
             # PPO+critic gives zero-variance groups a gradient (recipe §1), so
             # unlike the GRPO recipes there is no reason to drop them.
             filter_zero_std_groups=False,
+            checkpoint=CHECKPOINT,
         ),
     )
 

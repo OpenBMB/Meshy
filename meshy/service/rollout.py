@@ -45,8 +45,9 @@ def _build_rollout_worker(
     from meshy.worker.rollout import RolloutWorker
 
     trajectory_log = kwargs.get("trajectory_log")
-    if not trajectory_log and runtime_root:
-        trajectory_log = RuntimeDir(runtime_root).trajectory_path()
+    runtime = RuntimeDir(runtime_root) if runtime_root else None
+    if not trajectory_log and runtime is not None:
+        trajectory_log = runtime.trajectory_path()
     return RolloutWorker(
         engine=engine,
         endpoints_ref=kwargs["tq_endpoints_file"],
@@ -71,6 +72,12 @@ def _build_rollout_worker(
         trajectory_log=trajectory_log,
         verbose_trajectory_log=bool(kwargs.get("verbose_trajectory_log", False)),
         external_advantage=bool(kwargs.get("external_advantage", False)),
+        # ``asdict`` flattened the nested dataclass on the way in; ``coerce``
+        # inside the Worker turns the dict back into the typed config.
+        checkpoint=kwargs.get("checkpoint"),
+        resume_step=int(kwargs.get("resume_step", 0) or 0),
+        state_dir=runtime.state_dir if runtime is not None else None,
+        service_name=str(kwargs.get("service_name") or "rollout"),
         colocation=colocation,
     )
 
@@ -100,6 +107,7 @@ class RolloutService(Service):
         from dataclasses import asdict
 
         from meshy.config import RolloutServiceConfig, TrainingServiceConfig
+        from meshy.service.checkpoint import run_resume_step
         from meshy.transferqueue.client import resolve_endpoints_file
 
         config = info.config
@@ -112,6 +120,11 @@ class RolloutService(Service):
         # topology-derived wiring is injected alongside.
         kwargs = asdict(config)
         kwargs["inference_endpoints"] = topology.inference_endpoints()
+        # The rollout's shard is keyed by its service name, like every other
+        # role's, so a recipe with more than one rollout replica keeps them
+        # apart.
+        kwargs["service_name"] = info.name
+        kwargs["resume_step"] = run_resume_step(topology, runtime)
         kwargs["tq_endpoints_file"] = config.tq_endpoints_file or resolve_endpoints_file(
             runtime.root
         )

@@ -49,6 +49,8 @@ class CriticSpmdEngine(SpmdEngine):
         max_tokens_per_micro: int | None = None,
         publish_mode: str = "values",
         is_colocate: bool = False,
+        checkpoint: Any = None,
+        resume_step: int = 0,
         bind_host: str = "127.0.0.1",
         endpoint_port: int = 0,
     ) -> None:
@@ -103,6 +105,18 @@ class CriticSpmdEngine(SpmdEngine):
         #: against the weights it already holds.
         self.weight_version = 0
 
+        from meshy.config import GlobalCheckpointConfig
+
+        self.checkpoint = GlobalCheckpointConfig.coerce(checkpoint)
+        #: Global window index to restore to; 0 for a fresh run.
+        self.resume_step = int(resume_step)
+        #: Set by rank 0 in ``score_and_train`` and broadcast with the window,
+        #: like ``_publish``. The critic's window index *is* the run's global
+        #: clock (it advances from the very first window, cold start
+        #: included), but the counter itself belongs to the Worker.
+        self._global_step = 0
+        self._store = None
+
     # ── SpmdEngine hooks ────────────────────────────────────────────────
     def setup(self) -> None:
         from torchtitan.config.configs import (
@@ -154,14 +168,15 @@ class CriticSpmdEngine(SpmdEngine):
             train_backbone=self.train_backbone,
             model_spec=spec,
         )
-        # Cold start (recipe §2): backbone from the base model, value head
-        # random. Never the actor's current weights -- the critic must not
-        # inherit the policy's drift.
-        n = self.critic.load_backbone(self.model_path)
-        logger.info(
-            "Critic {} rank {}: loaded {:,} backbone params from {}; value head random",
-            self.name, self.rank, n, self.model_path,
-        )
+        if not self._restore_state():
+            # Cold start (recipe §2): backbone from the base model, value head
+            # random. Never the actor's current weights -- the critic must not
+            # inherit the policy's drift.
+            n = self.critic.load_backbone(self.model_path)
+            logger.info(
+                "Critic {} rank {}: loaded {:,} backbone params from {}; value head random",
+                self.name, self.rank, n, self.model_path,
+            )
         if self.is_colocate:
             self.offload_to_cpu()
 
@@ -179,8 +194,63 @@ class CriticSpmdEngine(SpmdEngine):
             return None
         raise ValueError(f"unknown critic command {action!r}")
 
+    # ── global checkpoint ────────────────────────────────────────────────
+    @property
+    def store(self):
+        """Lazily-built :class:`~meshy.service.checkpoint.StateStore`."""
+        if self._store is None:
+            self._store = self.runtime.state_store()
+        return self._store
+
+    def _restore_state(self) -> bool:
+        """Reload the value net and optimiser; ``False`` means start cold.
+
+        A resume *inside* the cold start is the case worth getting right: the
+        actor has never stepped and has nothing to restore, but the critic has
+        20-30 windows of value training that would otherwise be redone.
+        """
+        from meshy.service.checkpoint import log_resume
+
+        if self.resume_step <= 0:
+            return False
+        path = self.store.shard_dir(self.name, self.resume_step)
+        payload = self.store.payload(self.name, self.resume_step)
+        self.critic.load_state(path)
+        self.critic.train_steps = int(payload.get("train_steps", 0))
+        if self.is_master:
+            log_resume(
+                self.name,
+                self.resume_step,
+                f"train_steps={self.critic.train_steps} (LR warmup position preserved)",
+            )
+        return True
+
+    def _save_global_checkpoint(self, global_step: int) -> None:
+        """Persist the critic's shard. Collective: every rank must call."""
+        path = self.store.shard_dir(self.name, global_step)
+        self.critic.save_state(path)
+        self._barrier()
+        if not self.is_master:
+            return
+        self.store.write_meta(
+            self.name,
+            global_step,
+            {
+                "train_steps": int(self.critic.train_steps),
+                "windows": int(global_step),
+                "weight_version": int(self.weight_version),
+            },
+        )
+        self.store.mark_complete(self.name, global_step)
+        self.store.prune(self.name, self.checkpoint.keep_latest_k)
+        logger.info(
+            "Critic {} checkpointed global step {} -> {}", self.name, global_step, path
+        )
+
     # ── public API (rank 0) ─────────────────────────────────────────────
-    def score_and_train(self, samples: list[Any], *, publish: bool = True) -> Any:
+    def score_and_train(
+        self, samples: list[Any], *, publish: bool = True, global_step: int = 0
+    ) -> Any:
         """Score one window, publish the result, then update the value net.
 
         What is published depends on :attr:`publish_mode`: ``"values"`` returns
@@ -190,10 +260,14 @@ class CriticSpmdEngine(SpmdEngine):
         ``publish=False`` during the critic's cold start: the window still
         trains the value net, but nothing is returned, so the actor sees
         nothing (recipe §2).
+
+        ``global_step`` is the window index this call completes, on the run's
+        shared clock; it decides whether this window ends on a checkpoint.
         """
         # Read by rank 0 only, immediately before the broadcast inside
-        # ``_score_and_train_impl`` puts it on the wire for every rank.
+        # ``_score_and_train_impl`` puts them on the wire for every rank.
         self._publish = bool(publish)
+        self._global_step = int(global_step)
         return self.submit_command("score_and_train", samples=samples)
 
     # ── implementation (all ranks) ──────────────────────────────────────
@@ -230,10 +304,17 @@ class CriticSpmdEngine(SpmdEngine):
             raise RuntimeError("CriticSpmdEngine.score_and_train() called before init()")
 
         broadcast = self._broadcast(
-            {"samples": samples, "publish": self._publish} if self.is_master else None
+            {
+                "samples": samples,
+                "publish": self._publish,
+                "global_step": self._global_step,
+            }
+            if self.is_master
+            else None
         )
         rows = broadcast["samples"]
         publish = bool(broadcast["publish"])
+        global_step = int(broadcast["global_step"])
         batch_samples = samples_from_rows(rows)
 
         # ---- 1. plan: this rank's rows, packed into micro-batches --------
@@ -315,7 +396,14 @@ class CriticSpmdEngine(SpmdEngine):
                 for j, p in enumerate(m.sample_idx):
                     published[local_indices[p]] = v[j, : len(local[p].tokens)].clone()
 
-        # ---- 4. back to rank 0 -------------------------------------------
+        # ---- 4. checkpoint, while the value net is still resident ---------
+        # Every rank is inside the same broadcast command and (when colocated)
+        # the critic still holds the GPU token, so the collective DCP write is
+        # both safe and free of a CPU->GPU round trip.
+        if self.checkpoint.due(global_step):
+            self._save_global_checkpoint(global_step)
+
+        # ---- 5. back to rank 0 -------------------------------------------
         gathered = self._gather_to_master(
             {"diagnostics": accumulator.state, "published": published}
             if self._dp_representative

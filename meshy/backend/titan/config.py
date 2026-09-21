@@ -66,6 +66,9 @@ def _get_model_spec(model_name: str, model_flavor: str, attn_backend: str = "sdp
 def build_forge_config(
     trainer: "TrainerConfig",
     hf_model_path: str | None = None,
+    *,
+    state_dir: str | None = None,
+    resume_step: int = 0,
 ) -> ForgeEngine.Config:
     """Translate a :class:`~meshy.config.TrainerConfig` into a ForgeEngine.Config.
 
@@ -74,6 +77,16 @@ def build_forge_config(
             :class:`meshy.config.TrainerConfig` for per-field documentation).
         hf_model_path: local path to HuggingFace model weights. When set, the
             checkpoint manager initialises from HF format.
+        state_dir: this service's global-checkpoint directory
+            (``{runtime}/state/{service}``). When set, DCP checkpoints are
+            written there as ``step-{global_step}`` -- the same path
+            :class:`meshy.service.checkpoint.StateStore` commits a marker for,
+            so the two agree by construction. ``None`` keeps the old
+            recipe-relative ``{dump_folder}/{checkpoint_folder}`` behaviour.
+        resume_step: global step to load. Must be given explicitly rather than
+            left at torchtitan's "latest" (-1): the run's resume point is the
+            newest step *every* role reached, which can be older than the
+            newest step this trainer happens to have on disk.
     """
     model_spec = _get_model_spec(
         trainer.model_name, trainer.model_flavor, trainer.attn_backend
@@ -122,14 +135,32 @@ def build_forge_config(
             # ``trainer.enable_checkpoint`` keeps its user-facing meaning
             # (persist DCP checkpoints during training); the initial load is
             # enabled independently of it.
-            enable=trainer.enable_checkpoint or bool(hf_model_path),
-            # This is TorchTitan's native DCP resume directory. It is
-            # intentionally independent from XRL_CHECKPOINT_DIR, which is
-            # reserved for exported HF weights consumed by inference.
-            folder=trainer.checkpoint_folder,
+            enable=trainer.enable_checkpoint or bool(hf_model_path) or bool(state_dir),
+            # TorchTitan's native DCP directory, and the run's resume source.
+            # ``os.path.join`` keeps an absolute ``folder`` verbatim, so
+            # ``state_dir`` overrides the recipe-relative default and puts the
+            # shard exactly where StateStore commits its marker. It stays
+            # independent of XRL_CHECKPOINT_DIR, which holds the exported HF
+            # weights inference reloads -- those rotate on a far tighter
+            # budget than a resume needs.
+            folder=state_dir or trainer.checkpoint_folder,
             initial_load_path=hf_model_path,
             initial_load_in_hf=bool(hf_model_path),
             initial_load_model_only=True,
+            # Load the run's agreed resume point, not merely the newest shard
+            # this trainer owns. -1 (torchtitan's "latest") is only correct
+            # when the folder is absent, where the step is ignored anyway.
+            load_step=int(resume_step) if resume_step else -1,
+            # ``save()`` is driven by TitanEngine at the global-checkpoint
+            # boundary, so torchtitan's own interval must not veto it.
+            interval=1,
+            # The default drops optimizer / LR / step at the last save, which
+            # is precisely the state a resume exists to recover.
+            last_save_model_only=False,
+            # Rotation belongs to StateStore: it owns the ``.json`` /
+            # ``.complete`` sidecars next to each ``step-N`` directory, and two
+            # pruners on one directory would strand markers without shards.
+            keep_latest_k=0,
         ),
         activation_checkpoint=ActivationCheckpointConfig(
             mode=trainer.activation_checkpoint_mode,

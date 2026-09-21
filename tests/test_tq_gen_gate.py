@@ -84,3 +84,56 @@ def test_gate_stream_stays_bounded(client):
 def test_wait_gen_gate_times_out_cleanly(client):
     with pytest.raises(TimeoutError):
         control.wait_gen_gate(client, step=999, interval=0.05, timeout=0.3)
+
+
+# ── resume ───────────────────────────────────────────────────────────────
+class _StubEngine:
+    name = "actor_train-0"
+
+    def __init__(self, step_index: int) -> None:
+        self.step_index = step_index
+        self.weight_version = step_index
+
+
+def _worker(*, resume_step: int, cold_start: int, step_index: int):
+    from meshy.worker.titan import TitanWorker
+
+    return TitanWorker(
+        engine=_StubEngine(step_index),
+        endpoints_ref="unused",
+        partition_id="data.train",
+        tq_fields=["tokens"],
+        batch_size=8,
+        gate_step_offset=cold_start,
+        resume_step=resume_step,
+    )
+
+
+def _gate_step(outputs) -> int:
+    return int(outputs["gate"]["gate_step"].item())
+
+
+def test_genesis_gate_is_zero_on_a_fresh_run():
+    # Gate 0 establishes the version inference may generate against, and it
+    # precedes the critic's cold-start gates 1..N, so it is never offset.
+    worker = _worker(resume_step=0, cold_start=20, step_index=0)
+    assert _gate_step(worker.startup_tq_outputs()) == 0
+
+
+def test_genesis_gate_re_establishes_the_stream_at_the_resume_step():
+    # TQ is RAM-only, so a resumed run's gen_gate partition starts empty and
+    # this same pulse has to rebuild the stream *where the run stopped*.
+    # Numbering it 0 again would rewind every consumer's pacing budget.
+    worker = _worker(resume_step=35, cold_start=20, step_index=15)
+    assert _gate_step(worker.startup_tq_outputs()) == 35
+
+
+def test_the_first_gate_after_a_resume_follows_the_genesis_pulse():
+    # The trainer's step counter lags the global clock by the cold start, so
+    # step 16 must number its gate 36 -- one past the resume pulse, with no
+    # hole and no repeat for the rollout's ordering check to warn about.
+    worker = _worker(resume_step=35, cold_start=20, step_index=15)
+    assert _gate_step(worker.startup_tq_outputs()) == 35
+    worker.engine.step_index = 16
+    worker.engine.weight_version = 16
+    assert _gate_step(worker._gate_output(step=16)) == 36

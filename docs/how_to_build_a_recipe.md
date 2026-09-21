@@ -56,10 +56,19 @@ The dataset contract is small:
 1. The constructor accepts the configured `dataset_kwargs`.
 2. `next_batch(builder)` returns a list of prompt `Sample` objects.
 3. An empty list signals the end of the epoch.
+4. For a resumable run, the adapter must also be *seekable*: define
+   `seek(index)`, or expose a writable integer `index` counting the prompts
+   handed out so far (what every built-in adapter uses).
 
 `RolloutWorker` constructs a new dataset instance at the start of every epoch.
 Reset iteration state in the constructor. A fixed shuffle seed therefore
 produces the same ordering each epoch.
+
+That fixed ordering is also what makes a resume cheap: a checkpoint records
+`(epoch, index)`, and the resumed run rebuilds the dataset from the same seed
+and seeks forward instead of reshuffling. The check runs when the first epoch's
+dataset is built, so an adapter that cannot resume fails at startup rather than
+hours later after a crash.
 
 Use [SampleBuilder](../meshy/utils/sample.py) to apply the model's chat template
 and initialize aligned tokens, log probabilities, and loss masks. Put the
@@ -491,9 +500,47 @@ By default, artifacts appear under `.xrl_runtime/<timestamp>/`:
 
 - `logs/`: ignitor, service, and TransferQueue process logs.
 - `weights/`: exported weights used for synchronization.
+- `state/`: global checkpoints, when enabled (see below).
 - `tensorboard/`: training and rollout metrics.
 - `trajectories.jsonl`: generated responses, rewards, advantages, and version
   stamps; `verbose_trajectory_log=True` adds full token and mask details.
+
+### Enable checkpointing and resume
+
+Pass one `GlobalCheckpointConfig` to every service that has state — the
+trainer, the critic, and the rollout:
+
+```python
+from meshy.config import GlobalCheckpointConfig
+
+CHECKPOINT = GlobalCheckpointConfig(enabled=True, interval=10, keep_latest_k=3)
+```
+
+The *same* instance must reach all three. The resume point is the newest window
+every one of them committed a shard for, so services on different intervals
+would only intersect at their LCM; `build_topology` rejects that at startup.
+
+Every `interval` windows each role writes into
+`{runtime}/state/{service}/step-{N}/`: the actor's model, optimizer, LR
+schedule and step (torchtitan DCP), the critic's value net and AdamW, and the
+rollout's epoch plus dataset cursor. Continue an interrupted run with:
+
+```bash
+python scripts/launch.py --recipe recipe.my_grpo \
+    --runtime-dir .xrl_runtime/<the interrupted run> --resume
+```
+
+Reusing a `--runtime-dir` *without* `--resume` is an error, not a silent
+continuation. Exported HF weight versions rotate separately and much more
+tightly (`TrainingServiceConfig.weights_keep_latest_k`), but a version a
+retained checkpoint points at is never pruned — a resumed inference server
+boots from exactly that path.
+
+TransferQueue holds no state across a restart, so rows in flight at the
+checkpoint are lost and the rollout resumes from the prompt cursor it had
+already handed out. Up to one pacing window of prompts is skipped rather than
+replayed, which is what keeps a resumed run from training twice on the same
+prompt.
 
 Start with small batches and a small dataset. Check that services become ready,
 rollouts receive the initial gate, the trainer consumes a batch, and a new

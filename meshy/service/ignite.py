@@ -146,6 +146,7 @@ class Ignitor:
         bootstrap.get_store()
         gpus = _discover_gpus()
         topology = build_topology(self.service_groups, gpus, self.colocations)
+        self._check_resume(topology)
         if rank == 0:
             logger.info(
                 "Ignitor: {} cards discovered, runtime={}",
@@ -188,6 +189,66 @@ class Ignitor:
             logger.info("Rank {} ready: {}", rank, [s.name for s in self.services])
 
         self.join()
+
+    def _check_resume(self, topology: Topology) -> None:
+        """Decide fresh-vs-resume once, loudly, before any process starts.
+
+        Reusing a ``--runtime-dir`` without ``--resume`` is the dangerous case:
+        torchtitan's ``CheckpointManager.load()`` adopts an existing checkpoint
+        folder in preference to the base model *silently*, so the run would
+        continue an old one while every log line reads like a fresh start.
+        Make it an error and name the two ways out.
+        """
+        assert self.runtime is not None
+        from meshy.service.checkpoint import (
+            log_resume,
+            publish_resume_step,
+            resolve_resume_step,
+            resume_requested,
+        )
+
+        policy = topology.checkpoint_config()
+        store = self.runtime.state_store()
+        publish_resume_step(0)
+        if policy is None:
+            if store.has_any_shard() and resume_requested():
+                raise ValueError(
+                    f"--resume was passed but no service in this recipe enables "
+                    f"checkpointing, so {store.root} cannot be adopted. Set "
+                    "GlobalCheckpointConfig(enabled=True) on the recipe's services."
+                )
+            return
+        if not store.has_any_shard():
+            log_resume("run", 0)
+            return
+        if not resume_requested():
+            raise ValueError(
+                f"runtime directory {self.runtime.root} already holds global "
+                f"checkpoints ({store.root}) but --resume was not passed. Pass "
+                "--resume to continue that run, or use a fresh --runtime-dir to "
+                "start a new one."
+            )
+        step = resolve_resume_step(store, topology.checkpoint_participants)
+        publish_resume_step(step)
+        log_resume("run", step, f"participants={list(topology.checkpoint_participants(step))}")
+        if step <= 0:
+            raise ValueError(
+                f"--resume was passed and {store.root} holds shards, but no step "
+                "is complete across every participant "
+                f"({list(topology.checkpoint_participants(1))}). The run crashed "
+                "before its first full checkpoint; start fresh with a new "
+                "--runtime-dir."
+            )
+        if int(os.environ.get("RANK", 0)) == 0:
+            # One writer, before any Service is built. Other ranks may still
+            # be resolving, which is safe: only shards *above* the resume
+            # point go, and those cannot change anyone's answer.
+            for service, stale in store.drop_newer_than(step).items():
+                logger.info(
+                    "Resume: dropped {} shard(s) {} past the resume point",
+                    service,
+                    stale,
+                )
 
     def _gate_and_start(self, service: Service, info: ServiceInfo, topology: Topology) -> None:
         """Wait for ``info``'s dependencies, ignite, then wait until ready.

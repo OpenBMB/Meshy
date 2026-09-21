@@ -27,6 +27,59 @@ class SamplingParams:
         }
 
 
+@dataclass(frozen=True)
+class GlobalCheckpointConfig:
+    """How often the run persists its global state, and how much it keeps.
+
+    A Meshy run has no driver, so there is no process that could write "the"
+    checkpoint. Each role persists its own shard on a shared clock -- the
+    global window index -- and the resume point is *derived* as the newest step
+    at which every participant committed a shard (see
+    :mod:`meshy.service.checkpoint`).
+
+    One instance is shared by every checkpointing Service in a recipe. The
+    topology rejects a recipe whose services disagree, because the resume point
+    is an intersection over shards: services saving on different clocks would
+    simply never intersect.
+    """
+
+    enabled: bool = False
+    #: Global windows between checkpoints. Every participant uses the same
+    #: ``global_step % interval == 0`` test, which is what aligns their shards.
+    interval: int = 10
+    #: Complete checkpoints retained per service. Must be >= 2: the newest one
+    #: may be half-written by a peer that has not reached this step yet, so a
+    #: single retained step can leave the intersection empty.
+    keep_latest_k: int = 3
+
+    def __post_init__(self) -> None:
+        if self.interval <= 0:
+            raise ValueError(f"checkpoint interval must be positive, got {self.interval!r}")
+        if self.keep_latest_k < 2:
+            raise ValueError(
+                "checkpoint keep_latest_k must be >= 2; with 1 the only retained "
+                f"step can be one a peer has not written yet (got {self.keep_latest_k!r})"
+            )
+
+    def due(self, global_step: int) -> bool:
+        """Whether ``global_step`` is a checkpoint boundary."""
+        return self.enabled and global_step > 0 and global_step % self.interval == 0
+
+    @classmethod
+    def coerce(cls, value: "GlobalCheckpointConfig | dict | None") -> "GlobalCheckpointConfig":
+        """Accept an instance, a ``dataclasses.asdict`` dict, or ``None``.
+
+        The rollout Service flattens its whole typed config with ``asdict``
+        before handing it to the driver subprocess, which turns nested
+        dataclasses into plain dicts.
+        """
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        return cls(**value)
+
+
 @dataclass
 class TrainerConfig:
     model_name: str = "qwen3"
@@ -219,7 +272,18 @@ class TrainingServiceConfig(ServiceConfig):
     trainer_params: TrainerParamsConfig | None = None
     timer_enabled: bool = True
     weight_sync_mode: Literal["disk", "auto"] = "auto"
-    hf_save_interval: int = 0
+    #: Exported HF weight versions (``weights/{service}/v{N}``) kept on disk.
+    #: One full model is written *every* step for the inference hand-off, so
+    #: without rotation a long run fills the volume -- 296 steps of a 2.25B
+    #: model is terabytes. Versions a retained global checkpoint still points
+    #: at are never pruned, whatever this says. 0 keeps everything.
+    #:
+    #: Keep this above the run's staleness window: a colocated critic hands
+    #: the card back naming the version its *rows* were generated against
+    #: (``CriticWorker._actor_weights_for``), which lags the current step by
+    #: up to ``pacing_window`` -- or, when the rollout runs ungated, by
+    #: however far its in-flight cap lets it run ahead.
+    weights_keep_latest_k: int = 5
     stream_minibatch: bool = False
     tq_endpoints_file: str | None = None
     partition_id: str = DEFAULT_DATA_PARTITION
@@ -230,6 +294,9 @@ class TrainingServiceConfig(ServiceConfig):
     #: the rollout's gate stream stays monotonic. Must match
     #: ``CriticServiceConfig.cold_start_windows``; 0 when there is no critic.
     critic_cold_start_windows: int = 0
+    #: Global checkpoint / resume policy. Pass the *same* instance to the
+    #: critic and the rollout; the topology rejects a mismatch.
+    checkpoint: GlobalCheckpointConfig = field(default_factory=GlobalCheckpointConfig)
 
 
 @dataclass
@@ -270,6 +337,8 @@ class RolloutServiceConfig(ServiceConfig):
     partition_id: str = DEFAULT_DATA_PARTITION
     verbose_trajectory_log: bool = False
     trajectory_log: str | None = None
+    #: Global checkpoint / resume policy; see ``TrainingServiceConfig``.
+    checkpoint: GlobalCheckpointConfig = field(default_factory=GlobalCheckpointConfig)
     #: Hand the advantage to a critic Service: the rollout stops computing it
     #: and stops writing the column, so the trainer's AND-filter holds each row
     #: back until the critic publishes one. Mutually exclusive with
@@ -392,6 +461,10 @@ class CriticServiceConfig(ServiceConfig):
     tq_endpoints_file: str | None = None
     partition_id: str = DEFAULT_DATA_PARTITION
     tq_poll_interval: float = 0.5
+    #: Global checkpoint / resume policy; see ``TrainingServiceConfig``. The
+    #: critic is the one role with *no* other persistence: without this a crash
+    #: loses the value net and the whole cold start has to be paid again.
+    checkpoint: GlobalCheckpointConfig = field(default_factory=GlobalCheckpointConfig)
 
     def __post_init__(self) -> None:
         if self.publish_mode not in CRITIC_OUTPUT_FIELDS_BY_MODE:
@@ -484,6 +557,7 @@ __all__ = [
     "GAE_TRAINER_FIELDS",
     "GAE_TRAINER_FIELDS_SHAPED",
     "GRPO_TRAINER_FIELDS",
+    "GlobalCheckpointConfig",
     "InferenceServiceConfig",
     "OPDTeacherConfig",
     "OPDTrainingConfig",

@@ -50,7 +50,8 @@ inference memory/weight management.
 | `TitanTrainingService` | `training.py` | Wires `TitanEngine` and `TitanWorker` |
 | `RolloutService` | `rollout.py` | CPU-only process running `RolloutWorker.run_async()` |
 | `ColocationManager` / `NoopColocationManager` | `colocation.py` | Token-ring state machine or no-op outside a ring |
-| `RuntimeDir` | `runtime.py` | Weights, logs, TensorBoard, trajectory artifacts, and readiness markers |
+| `RuntimeDir` | `runtime.py` | Weights, checkpoint state, logs, TensorBoard, trajectory artifacts, and readiness markers |
+| `StateStore` | `checkpoint.py` | Global checkpoint shards, commit markers, and resume-point derivation |
 | Bootstrap store | `bootstrap.py` | Run-level `TCPStore`, hosted by rank 0 unless `XRL_BOOTSTRAP_ADDR` is provided |
 
 ### 2.1 Typed configuration (`meshy/config.py`)
@@ -217,15 +218,49 @@ bootstrap on rank 0, but TQ must be started separately.
 | `tests/test_agentloop_driver.py` | End-to-end rollout driver |
 | `tests/test_rollout_advantage.py`, `test_math_reward.py` | Advantages and math rewards |
 | `tests/test_weight_sync.py` | Checkpoint grants and weight synchronization |
+| `tests/test_global_checkpoint.py` | Shard commit, resume-point intersection, cold-start participants |
+| `tests/test_rollout_resume.py` | Dataset seek contract and rollout counter round-trip |
+| `tests/test_weight_rotation.py` | Exported HF weight rotation and its protected versions |
 | `tests/test_dynamic_batching*.py` | Dynamic batching layouts |
 | `tests/test_minicpm5_*.py` | MiniCPM5 registration and parity |
 | `scripts/smoke/run.sh` | GPU smoke tests |
 
-## 11. Future Directions
+## 11. Global Checkpoint and Resume
+
+Checkpointing is opt-in through one `GlobalCheckpointConfig`
+(`meshy/config.py`) shared by the training, critic, and rollout services. There
+is no coordinator: each role writes its own shard on one shared clock, and the
+resume point is derived rather than recorded.
+
+| Concept | Value |
+|---|---|
+| Clock | The gate step. `global_step == CriticWorker.windows == TitanEngine.step_index + critic_cold_start_windows` |
+| Layout | `{runtime}/state/{service}/step-{N}/` plus `step-{N}.json` and `step-{N}.complete` |
+| Commit | The `.complete` marker, written last by the replica master; a torn shard is invisible |
+| Resume point | `max{N : every participant at N has a complete shard}` |
+| Participants | Critic and rollout always; training only when `N > critic_cold_start_windows`, because it takes no step during the cold start |
+
+Contents per role: the actor writes model, optimizer, LR schedule, and step
+through torchtitan's `CheckpointManager` (DCP); the critic writes its value net
+and AdamW state through `dcp.save`; the rollout writes its epoch and dataset
+cursor as JSON. Each role saves while it still holds the GPU token, inside the
+same broadcast command every rank is executing.
+
+On resume the trainer re-publishes its genesis gate at the resume step rather
+than at 0, because TransferQueue starts empty; the rollout restores
+`gates_seen` one below its snapshot so it consumes exactly that pulse. Rows in
+flight at the checkpoint are lost, and the rollout skips the prompts it had
+already handed out rather than replaying them.
+
+`--resume` (`scripts/launch.py`) reuses a `--runtime-dir`. Reusing one without
+the flag is rejected at startup.
+
+## 12. Future Directions
 
 - Per-rank direct TQ consumption instead of rank-0 broadcast.
 - Multiple rollout replicas with sharded generation.
 - Exact per-sample staleness labels when `W > 1`.
 - Zero-copy weight transfer.
 - Reclaim closed colocation ledger rows.
-- Activate `hf_save_interval`.
+- Resume across a changed card count or parallel degree (DCP can reshard; the
+  topology validation and the critic's mesh have not been exercised for it).

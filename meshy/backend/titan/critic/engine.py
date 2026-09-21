@@ -254,6 +254,53 @@ class CriticEngine:
         logger.info("load_backbone: loaded {} param values from {}", n, hf_path)
         return n
 
+    # ── resumable state ──────────────────────────────────────────────────
+    # The critic has no ``CheckpointManager``: it is not a ForgeEngine, its
+    # optimiser is a plain AdamW rather than an ``OptimizersContainer``, and it
+    # has no LR scheduler (warmup is derived from ``train_steps``). DCP over
+    # ``get_state_dict`` / ``set_state_dict`` covers all of that directly --
+    # those helpers understand both DTensor parameters and optimizer moments
+    # living on the same mesh. Losing this state is not a cosmetic failure: the
+    # value net is the only thing the cold-start windows produce.
+
+    def _dcp_state(self) -> dict[str, Any]:
+        from torch.distributed.checkpoint.state_dict import get_state_dict
+
+        model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
+        return {"model": model_sd, "optim": optim_sd}
+
+    @torch.no_grad()
+    def save_state(self, path: str) -> None:
+        """Write model + optimiser to ``path`` as DCP. Collective on all ranks."""
+        import torch.distributed.checkpoint as dcp
+
+        dcp.save(self._dcp_state(), checkpoint_id=path)
+        logger.info("CriticEngine.save_state: wrote {} (train_steps={})", path, self.train_steps)
+
+    @torch.no_grad()
+    def load_state(self, path: str) -> None:
+        """Restore model + optimiser from a DCP directory written by :meth:`save_state`.
+
+        Mutually exclusive with :meth:`load_backbone`: the restored value head
+        and backbone are the critic's learned state, and re-running the base
+        model load over them would silently throw away every window of value
+        training the checkpoint exists to preserve.
+        """
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import set_state_dict
+
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Not a critic checkpoint directory: {path}")
+        state = self._dcp_state()
+        dcp.load(state, checkpoint_id=path)
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state["model"],
+            optim_state_dict=state["optim"],
+        )
+        logger.info("CriticEngine.load_state: restored value net + optimiser from {}", path)
+
     def align_from_batch(self, batch: dict[str, torch.Tensor]) -> int:
         """Padded width ``make_batch`` must use for this batch to survive CP.
 

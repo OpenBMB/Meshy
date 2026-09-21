@@ -13,6 +13,16 @@ second torchrun: each shared card's ignitor ignites the inference replica first
 
 For multi-node, run this on every node with matching ``--nnodes`` /
 ``--node-rank`` / ``--master-addr`` and an explicit ``--nproc-per-node``.
+
+To continue an interrupted run, point ``--runtime-dir`` at it and add
+``--resume``::
+
+    python scripts/launch.py --recipe recipe.justrl_ii_minicpm5_2b \\
+        --runtime-dir .xrl_runtime/20260921-101500 --resume
+
+Every Service then restores itself to the newest global step all of them
+reached (see :mod:`meshy.service.checkpoint`). Reusing a ``--runtime-dir``
+*without* ``--resume`` is rejected at startup rather than silently continuing.
 """
 
 from __future__ import annotations
@@ -40,6 +50,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="cards per node (defaults to total cards; required for multi-node)",
     )
     ap.add_argument("--runtime-dir", default=None, help="shared runtime dir (default: timestamped)")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "continue the run in --runtime-dir from its newest global checkpoint "
+            "(the newest step every checkpointing service reached). Without it, "
+            "a --runtime-dir that already holds checkpoints is an error."
+        ),
+    )
     ap.add_argument("--checkpoint-dir", default=None, help="checkpoint output directory (default: <runtime>/weights)")
     ap.add_argument("--log-dir", default=None, help="service and engine log directory (default: <runtime>/logs)")
     ap.add_argument("--tensorboard-dir", default=None, help="TensorBoard event directory (default: <runtime>/tensorboard)")
@@ -83,8 +102,19 @@ def main() -> None:
     # would give the launcher and the ignitors two different answers.
     runtime_dir = args.runtime_dir or os.environ.get("XRL_RUNTIME_DIR")
     if not runtime_dir:
+        if args.resume:
+            # The default is a fresh timestamp, so resuming without naming the
+            # old run would silently start from scratch.
+            raise SystemExit(
+                "--resume needs --runtime-dir pointing at the run to continue "
+                "(or XRL_RUNTIME_DIR set to it)"
+            )
         runtime_dir = os.path.abspath(os.path.join(".xrl_runtime", time.strftime("%Y%m%d-%H%M%S")))
     os.environ["XRL_RUNTIME_DIR"] = runtime_dir
+    if args.resume:
+        from meshy.service.checkpoint import RESUME_ENV
+
+        os.environ[RESUME_ENV] = "1"
     os.makedirs(runtime_dir, exist_ok=True)
     for arg_name, env_name in (
         ("checkpoint_dir", "XRL_CHECKPOINT_DIR"),
@@ -121,7 +151,7 @@ def main() -> None:
     env["PYTHONPATH"] = os.pathsep.join([repo_root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
 
     print(f"[launch] recipe={args.recipe} cards={total_cards} nproc-per-node={nproc} "
-          f"colocate={has_colocate} runtime={runtime_dir}", flush=True)
+          f"colocate={has_colocate} resume={args.resume} runtime={runtime_dir}", flush=True)
 
     # TransferQueue is mandatory infrastructure: the data plane (samples) and
     # the control plane (gen gates) both ride on it, so it must be up before

@@ -46,13 +46,27 @@ def build_titan_trainer(
     timer_enabled: bool,
     runtime_root: str | None = None,
     name: str = "titan",
+    *,
+    state_dir: str | None = None,
+    resume_step: int = 0,
 ):
-    """Build Meshy's TitanTrainer metrics adapter."""
+    """Build Meshy's TitanTrainer metrics adapter.
+
+    ``state_dir`` points the DCP checkpointer at this service's global-
+    checkpoint directory; when it already contains ``step-{resume_step}`` the
+    trainer restores model + optimizer + LR schedule + its own step counter
+    instead of doing the initial HF load.
+    """
     from meshy.backend.titan import TitanTrainer, build_forge_config
     from meshy.utils.model import resolve_model_path
 
     local_path = resolve_model_path(model_path)
-    forge_config = build_forge_config(trainer_config, hf_model_path=local_path)
+    forge_config = build_forge_config(
+        trainer_config,
+        hf_model_path=local_path,
+        state_dir=state_dir,
+        resume_step=resume_step,
+    )
     from meshy.service.runtime import RuntimeDir
     runtime = RuntimeDir(runtime_root) if runtime_root else None
     return TitanTrainer(
@@ -133,7 +147,10 @@ class TitanEngine(SpmdEngine):
         inference_targets: list[dict[str, Any]] | None = None,
         managed_inference_names: list[str] | None = None,
         weight_sync_mode: str = "disk",
-        hf_save_interval: int = 0,
+        weights_keep_latest_k: int = 0,
+        checkpoint: Any = None,
+        gate_step_offset: int = 0,
+        resume_step: int = 0,
         bind_host: str = "127.0.0.1",
         endpoint_port: int = 0,
     ) -> None:
@@ -164,13 +181,34 @@ class TitanEngine(SpmdEngine):
         self.inference_targets = list(inference_targets or [])
         self.managed_inference_names = set(managed_inference_names or [])
         self.weight_sync_mode = weight_sync_mode
-        self.hf_save_interval = int(hf_save_interval or 0)
+        self.weights_keep_latest_k = int(weights_keep_latest_k or 0)
+
+        from meshy.config import GlobalCheckpointConfig
+
+        self.checkpoint = GlobalCheckpointConfig.coerce(checkpoint)
+        #: Windows the critic consumes before this trainer's first step; the
+        #: offset between this engine's ``step_index`` and the run's global
+        #: window index (see :meth:`global_step`).
+        self.gate_step_offset = int(gate_step_offset)
+        #: Global window index this engine restores to; 0 for a fresh run.
+        self.resume_step = int(resume_step)
 
         self.trainer = None
         self.train_chunk_size: int | None = None
         self.step_index = 0
         self.weight_version = 0
         self.last_weights_path: str | None = None
+        self._store = None
+
+    @property
+    def global_step(self) -> int:
+        """This engine's step on the run's shared clock (the gate stream).
+
+        The critic's cold-start windows come before the trainer's first step,
+        so the trainer's own counter lags the global one by exactly that
+        offset -- the same offset ``TitanWorker`` adds to its gate numbers.
+        """
+        return self.step_index + self.gate_step_offset
 
     def init(self) -> None:
         """Initialize SPMD state and construct TitanTrainer."""
@@ -184,7 +222,10 @@ class TitanEngine(SpmdEngine):
             self.timer_enabled,
             runtime_root=self.runtime.root,
             name=self.name,
+            state_dir=self._state_dir(),
+            resume_step=self.resume_step,
         )
+        self._restore_counters()
         mesh = self.trainer.parallel_dims.get_optional_mesh("batch")
         dp_size = mesh.size() if mesh is not None else 1
         self.train_chunk_size = self.trainer.mini_batch_size * dp_size
@@ -273,7 +314,7 @@ class TitanEngine(SpmdEngine):
         new_step = self.step_index + 1
         weights_path = self._weights_path(new_step) if self.publish_weights else None
         if weights_path is not None:
-            self.save_checkpoint(weights_path)
+            self.export_hf_weights(weights_path)
             self.last_weights_path = weights_path
             # Colocated inference receives this path through the next GPU grant
             # (the trainer must release the card before inference can resume).
@@ -288,6 +329,14 @@ class TitanEngine(SpmdEngine):
                 )
         self.step_index = new_step
         self.weight_version = new_step
+
+        # Still holding the GPU token here, and every rank is inside the same
+        # broadcast command -- the only point in the window where a collective
+        # DCP save is both safe and cheap (the model is resident, so nothing
+        # has to be paged back from CPU).
+        if self.checkpoint.due(self.global_step):
+            self._save_global_checkpoint(self.global_step)
+        self._prune_weights(new_step)
 
         result = StepResult(
             metrics=dict(metrics) if isinstance(metrics, dict) else {"value": metrics},
@@ -307,8 +356,161 @@ class TitanEngine(SpmdEngine):
     def _weights_path(self, version: int) -> str:
         return self.runtime.checkpoint_path(self.name, version)
 
-    def save_checkpoint(self, path: str) -> None:
-        """Save the current model as an HF checkpoint on all ranks."""
+    # ── global checkpoint ────────────────────────────────────────────────
+    def _state_dir(self) -> str | None:
+        """Where this service's DCP shards live, or ``None`` when disabled."""
+        import os
+
+        if not self.checkpoint.enabled:
+            return None
+        return os.path.join(self.runtime.state_dir, self.name)
+
+    @property
+    def store(self):
+        """Lazily-built :class:`~meshy.service.checkpoint.StateStore`."""
+        if self._store is None:
+            self._store = self.runtime.state_store()
+        return self._store
+
+    def _restore_counters(self) -> None:
+        """Re-seed the engine's own counters from the restored shard.
+
+        ``TitanTrainer.step`` comes back through DCP, but ``step_index`` /
+        ``weight_version`` / ``last_weights_path`` are the engine's and are not
+        in any state dict. They are read from the shard's sidecar rather than
+        derived from ``trainer.step``: the two coincide today but diverge under
+        ``stream_minibatch``, and silently exporting ``v1`` over a previous
+        run's ``v1`` is not a failure anything downstream would notice.
+        """
+        from meshy.service.checkpoint import log_resume
+
+        if self.resume_step <= 0:
+            return
+        if not self.store.is_complete(self.name, self.resume_step):
+            # Resuming inside the critic's cold start: the actor has not taken
+            # a step, so it is not a participant at this step and has nothing
+            # on disk. The DCP folder is absent too, so the trainer has
+            # already done its initial HF load and the zeroed counters below
+            # are correct. Anything later is a genuinely missing shard.
+            if self.gate_step_offset and self.resume_step <= self.gate_step_offset:
+                if self.is_master:
+                    log_resume(
+                        self.name,
+                        self.resume_step,
+                        "still in the critic's cold start; the actor has not "
+                        "stepped, so it starts from the base model",
+                    )
+                return
+            raise FileNotFoundError(
+                f"resuming at global step {self.resume_step} but "
+                f"{self.store.meta_path(self.name, self.resume_step)} is missing; "
+                "the shard is incomplete"
+            )
+        payload = self.store.payload(self.name, self.resume_step)
+        self.step_index = int(payload["step_index"])
+        self.weight_version = int(payload["weight_version"])
+        self.last_weights_path = payload.get("weights_path")
+        trainer_step = int(getattr(self.trainer, "step", 0))
+        if trainer_step != int(payload["trainer_step"]):
+            raise RuntimeError(
+                f"{self.name}: DCP restored trainer.step={trainer_step} but the "
+                f"shard's metadata records {payload['trainer_step']}. The "
+                f"checkpoint directory {self.store.shard_dir(self.name, self.resume_step)} "
+                "and its sidecar disagree; they are not from the same run."
+            )
+        if self.is_master:
+            log_resume(
+                self.name,
+                self.resume_step,
+                f"step_index={self.step_index} trainer.step={trainer_step} "
+                f"weights={self.last_weights_path}",
+            )
+
+    def _save_global_checkpoint(self, global_step: int) -> None:
+        """Persist this trainer's shard. Collective: every rank must call."""
+        if self.trainer is None:
+            raise RuntimeError("TitanEngine is not initialized")
+        self.trainer.save_checkpoint(global_step)
+        self._barrier()
+        if not self.is_master:
+            return
+        self.store.write_meta(
+            self.name,
+            global_step,
+            {
+                "step_index": self.step_index,
+                "weight_version": self.weight_version,
+                "weights_path": self.last_weights_path,
+                "trainer_step": int(getattr(self.trainer, "step", 0)),
+            },
+        )
+        self.store.mark_complete(self.name, global_step)
+        self.store.prune(self.name, self.checkpoint.keep_latest_k)
+        logger.info(
+            "Titan {} checkpointed global step {} -> {}",
+            self.name,
+            global_step,
+            self.store.shard_dir(self.name, global_step),
+        )
+
+    def _protected_weight_versions(self) -> set[int]:
+        """Exported versions a retained global checkpoint still points at.
+
+        A resumed run hands its inference servers the weights the shard names
+        (``SGLangService`` genesis, ``CriticWorker._actor_weights_for``), so
+        pruning one of those would make the checkpoint unusable even though
+        the DCP shard itself survived.
+        """
+        protected: set[int] = set()
+        for step in self.store.complete_steps(self.name):
+            version = self.store.payload(self.name, step).get("weight_version")
+            if version is not None:
+                protected.add(int(version))
+        return protected
+
+    def _prune_weights(self, current: int) -> None:
+        """Rotate the exported HF weight directories (rank 0 only).
+
+        One full model is written per step purely so inference can reload it;
+        nothing reads an old version once the next one lands. Left alone, a
+        few hundred steps of a 2.25B model is terabytes -- long runs have died
+        of exactly this.
+        """
+        import os
+        import re
+        import shutil
+
+        if self.weights_keep_latest_k <= 0 or not self.is_master:
+            return
+        directory = self.runtime.weights_dir(self.name)
+        try:
+            entries = os.listdir(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        versions = sorted(
+            int(m.group(1)) for m in (re.match(r"^v(\d+)$", e) for e in entries) if m
+        )
+        keep = set(versions[-self.weights_keep_latest_k :])
+        keep.update(self._protected_weight_versions())
+        keep.add(int(current))
+        dropped = [v for v in versions if v not in keep]
+        for version in dropped:
+            shutil.rmtree(self._weights_path(version), ignore_errors=True)
+        if dropped:
+            logger.info(
+                "Titan {} pruned exported weights {} (kept {})",
+                self.name,
+                dropped,
+                sorted(keep & set(versions)),
+            )
+
+    def export_hf_weights(self, path: str) -> None:
+        """Export the current model as an HF checkpoint for inference to load.
+
+        This is the weight-sync path, not a resumable checkpoint: it carries
+        no optimizer, LR schedule or step. See :meth:`_save_global_checkpoint`
+        for the one a resume reads. All ranks must call together.
+        """
         if self.trainer is None:
             raise RuntimeError("TitanEngine is not initialized")
         self.trainer.save_hf_checkpoint(path)
@@ -345,7 +547,9 @@ class TitanEngine(SpmdEngine):
     def health_info(self) -> dict[str, Any]:
         return {
             "step": self.step_index,
+            "global_step": self.global_step,
             "weight_version": self.weight_version,
+            "resumed_from": self.resume_step,
             "ready": self.ready,
         }
 

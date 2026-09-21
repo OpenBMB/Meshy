@@ -3,8 +3,9 @@
 Endpoints / placement are **derived locally** from the SPMD-gathered GPU list
 (see :mod:`meshy.service.topology`), so no cross-process *topology* files are
 needed. The shared runtime directory (``XRL_RUNTIME_DIR``) now exists only for
-on-disk artifacts: weight checkpoints ``weights/{name}/vN``, engine logs and
-rollout trajectories.
+on-disk artifacts: weight checkpoints ``weights/{name}/vN``, resumable run
+state ``state/{name}/step-N`` (:mod:`meshy.service.checkpoint`), engine logs
+and rollout trajectories.
 
 Readiness markers -- "worker X is truly ready" (for colocate inference: only
 after it has released its GPU memory) -- used to be empty files under
@@ -33,6 +34,7 @@ class RuntimeDir:
         log_dir: str | None = None,
         tensorboard_dir: str | None = None,
         trajectory_dir: str | None = None,
+        state_dir: str | None = None,
     ) -> None:
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
@@ -40,6 +42,15 @@ class RuntimeDir:
             checkpoint_dir
             or os.environ.get("XRL_CHECKPOINT_DIR")
             or os.path.join(self.root, "weights")
+        )
+        # Resumable run state (see :mod:`meshy.service.checkpoint`). Kept apart
+        # from ``checkpoint_dir``: that one holds HF exports whose only job is
+        # to be reloaded by an inference server, and it is rotated on a much
+        # tighter budget than the DCP shards a resume needs.
+        self.state_dir = os.path.abspath(
+            state_dir
+            or os.environ.get("XRL_STATE_DIR")
+            or os.path.join(self.root, "state")
         )
         self.log_dir = os.path.abspath(
             log_dir or os.environ.get("XRL_LOG_DIR") or os.path.join(self.root, "logs")
@@ -75,6 +86,16 @@ class RuntimeDir:
     def checkpoint_path(self, service_name: str, version: int) -> str:
         """Return the HF checkpoint directory for one service version."""
         return os.path.join(self.checkpoint_dir, service_name, f"v{int(version)}")
+
+    def weights_dir(self, service_name: str) -> str:
+        """Return the directory holding one service's exported ``vN`` versions."""
+        return os.path.join(self.checkpoint_dir, service_name)
+
+    def state_store(self):
+        """Return this run's :class:`~meshy.service.checkpoint.StateStore`."""
+        from meshy.service.checkpoint import StateStore
+
+        return StateStore(self.state_dir)
 
     def tensorboard_path(self, service_name: str) -> str:
         """Return the TensorBoard event directory for one service."""
