@@ -330,6 +330,7 @@ class TitanTrainer(_BackendTitanTrainer):
             # construction under the behaviour policy, so read ``ppo_kl`` /
             # ``log_ratio_abs_mean`` for how far off-policy the batch is.
             "ratio_mean": ("train/ois", "train/tis"),
+            "tis_ratio_mean": "train/tis",
             "clip_frac": "train/pg_clipfrac",
             "tis_masked_frac": ("train/tis_masked_token_ratio", "train/tis_clipfrac"),
             "ppo_kl": "train/ppo_kl",

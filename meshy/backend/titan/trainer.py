@@ -123,6 +123,7 @@ class TitanTrainer(ForgeEngine):
         old_logprobs_source: Literal["rollout", "train"] = "rollout",
         calculate_per_token_loss: bool = False,
         use_tis: bool = False,
+        use_icepop: bool = False,
         tis_ratio_min: float = 0.5,
         tis_ratio_max: float = 5.0,
         logprob_chunk_size: int = 1024,
@@ -160,6 +161,7 @@ class TitanTrainer(ForgeEngine):
         self.old_logprobs_source = old_logprobs_source
         self.calculate_per_token_loss = bool(calculate_per_token_loss)
         self.use_tis = bool(use_tis)
+        self.use_icepop = bool(use_icepop)
         self.tis_ratio_min = float(tis_ratio_min)
         self.tis_ratio_max = float(tis_ratio_max)
         if self.use_tis and not (0.0 < self.tis_ratio_min <= self.tis_ratio_max):
@@ -543,7 +545,7 @@ class TitanTrainer(ForgeEngine):
         with self.train_context():
             for micro in mini.micros:
                 mb = self._build_micro(samples, micro, need_rollout_lp=False)
-                out.append(self._forward_batch(mb))
+                out.append(self._forward_batch(mb).cpu())
                 del mb
         return out
 
@@ -755,7 +757,15 @@ class TitanTrainer(ForgeEngine):
             ratio, 1 - self.ppo_clip_eps_low, 1 + self.ppo_clip_eps_high,
         ) * adv_tok
         pg_per_token = -torch.min(pg_unclipped, pg_clipped)
-        if self.use_tis:
+        tis_ratio = ratio.detach()
+        if getattr(self, "use_icepop", False):
+            if mb.rollout_logprobs is None:
+                raise ValueError("IcePop requires rollout log-probabilities")
+            tis_ratio = (old_lp - mb.rollout_logprobs).detach().exp()
+            tis_mask = (tis_ratio >= self.tis_ratio_min) & (tis_ratio <= self.tis_ratio_max)
+            weight = torch.where(tis_mask, tis_ratio, 0)
+            pg_per_token = torch.where(tis_mask, pg_per_token, 0) * weight
+        elif self.use_tis:
             tis_mask = (ratio >= self.tis_ratio_min) & (ratio <= self.tis_ratio_max)
             # ``where`` avoids ``0 * inf -> nan`` for pathological log-ratios.
             pg_per_token = torch.where(tis_mask, pg_per_token, torch.zeros_like(pg_per_token))
@@ -778,13 +788,13 @@ class TitanTrainer(ForgeEngine):
             )
 
         with torch.no_grad():
-            eps = max(self.ppo_clip_eps_low, self.ppo_clip_eps_high)
             ratio_d = ratio.detach()
             log_ratio_d = log_ratio.detach()
             sums = {
                 "loss": loss.detach(),
+                "tis_ratio_sum": (tis_ratio * mask).sum(),
                 "ratio_sum": (ratio_d * mask).sum(),
-                "clip_sum": (((ratio_d - 1).abs() > eps).float() * mask).sum(),
+                "clip_sum": (((ratio_d < 1 - self.ppo_clip_eps_low) | (ratio_d > 1 + self.ppo_clip_eps_high)).float() * mask).sum(),
                 "tis_masked_sum": ((~tis_mask).float() * mask).sum(),
                 "token_count": mask.sum(),
                 "ppo_kl_sum": (-log_ratio_d * mask).sum(),
@@ -834,11 +844,15 @@ class TitanTrainer(ForgeEngine):
         ``None`` the rank plans ``samples`` on its own as a single-rank job,
         which is what ``world_size == 1`` and the unit tests want.
 
+        With IcePop, freeze all mini-batches' training log-probabilities on
+        CPU before the first optimizer update in this window. Legacy
+        ``old_logprobs_source='train'`` without IcePop snapshots per mini.
+
         Layout per mini-batch (one ``optimizer.step()`` each):
         1. Snapshot the behavior-policy log-probs for the mini-batch's
            micro plan — rollout log-probs come with the samples, ``"train"``
            runs a no-grad forward over the same micro-batches *before* the
-           optimizer moves.
+           optimizer moves (window-wide when IcePop is enabled).
         2. For every micro-batch: build it, forward, PPO loss normalised by
            the mini-batch's global denominators, backward.
         3. Clip + step.
@@ -881,8 +895,15 @@ class TitanTrainer(ForgeEngine):
 
         all_metrics: list[dict[str, float]] = []
         grad_norms: list[torch.Tensor] = []
-        for mini in plan:
-            mini_metrics, grad_norm = self._run_mini_batch(samples, mini, timer)
+        snapshots = None
+        if self.old_logprobs_source == "train" and getattr(self, "use_icepop", False):
+            with timer.timer("train/old_logprobs", sync=True):
+                snapshots = [self._compute_old_logprobs_train(samples, mini) for mini in plan]
+        for index, mini in enumerate(plan):
+            if snapshots is None:
+                mini_metrics, grad_norm = self._run_mini_batch(samples, mini, timer)
+            else:
+                mini_metrics, grad_norm = self._run_mini_batch(samples, mini, timer, snapshots[index])
             all_metrics.append(mini_metrics)
             grad_norms.append(grad_norm)
 
@@ -906,6 +927,7 @@ class TitanTrainer(ForgeEngine):
         samples: Sequence[Any],
         mini: MiniPlan,
         timer: TimerStats,
+        old_lps: list[torch.Tensor | None] | None = None,
     ) -> tuple[dict[str, float], "torch.Tensor"]:
         """Accumulate gradients over ``mini``'s micro-batches, then one optimizer step.
 
@@ -914,8 +936,10 @@ class TitanTrainer(ForgeEngine):
         Returns the mini-batch's globally reduced metrics and gradient norm.
         """
         with timer.timer("train/old_logprobs", sync=True):
-            if self.old_logprobs_source == "train":
-                old_lps: list[torch.Tensor | None] = list(
+            if old_lps is not None:
+                pass
+            elif self.old_logprobs_source == "train":
+                old_lps = list(
                     self._compute_old_logprobs_train(samples, mini)
                 )
             else:
@@ -932,6 +956,7 @@ class TitanTrainer(ForgeEngine):
                     "rollout log-probs"
                 )
                 old_lp = mb.rollout_logprobs
+            old_lp = old_lp.to(mb.input_ids.device)
             with self.train_context():
                 with timer.timer("train/forward", sync=True):
                     entropy = None
@@ -994,6 +1019,8 @@ class TitanTrainer(ForgeEngine):
             out["train_rollout_logdiff_abs"] = values["train_rollout_logdiff_abs_sum"] / tokens
         if "entropy_sum" in values:
             out["entropy"] = values["entropy_sum"] / tokens
+        if "tis_ratio_sum" in values:
+            out["tis_ratio_mean"] = values["tis_ratio_sum"] / tokens
         return out
 
     def _aggregate_metrics(
