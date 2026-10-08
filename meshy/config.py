@@ -439,6 +439,8 @@ class CriticServiceConfig(ServiceConfig):
     #: before it beats the whitening baseline (var_reduction stays < 0).
     train_backbone: bool = True
     lr: float = 5e-6
+    optimizer_kwargs: dict[str, Any] | None = None
+    value_clip: float | None = None
     #: critic lr warmup, recipe §2
     warmup_steps: int = 10
     #: Windows the critic consumes on its own before publishing any advantage,
