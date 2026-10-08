@@ -127,6 +127,7 @@ class TitanTrainer(ForgeEngine):
         tis_ratio_max: float = 5.0,
         logprob_chunk_size: int = 1024,
         enable_gae: bool = False,
+        normalize_advantages: bool = False,
         gae_gamma: float = 1.0,
         gae_alpha: float = 1.5,
         gae_lambda: float | None = None,
@@ -168,6 +169,7 @@ class TitanTrainer(ForgeEngine):
         self._LOGPROB_CHUNK = int(logprob_chunk_size)
         # Validated upstream by ``meshy.config.TrainerParamsConfig``.
         self.enable_gae = bool(enable_gae)
+        self.normalize_advantages = bool(normalize_advantages)
         self.gae_gamma = float(gae_gamma)
         self.gae_alpha = float(gae_alpha)
         self.gae_lambda = None if gae_lambda is None else float(gae_lambda)
@@ -869,6 +871,13 @@ class TitanTrainer(ForgeEngine):
             # column out of the sample.
             with timer.timer("train/gae"):
                 gae_metrics = self._attach_gae_advantages(samples)
+                if getattr(self, "normalize_advantages", False):
+                    from .vapo import whiten_advantages
+                    whiten_advantages(
+                        samples, self.seq_len, self.device,
+                        self.parallel_dims.get_optional_mesh("loss"),
+                        max(1, self.parallel_dims.cp),
+                    )
 
         all_metrics: list[dict[str, float]] = []
         grad_norms: list[torch.Tensor] = []

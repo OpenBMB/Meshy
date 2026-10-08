@@ -1,14 +1,51 @@
 """CPU regression tests; runnable with unittest without extra dependencies."""
 import contextlib
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace as NS
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from meshy.backend.titan.vapo import clipped_value_error, critic_parameter_groups
+from meshy.backend.titan.batch import ADVANTAGE_TOKENS
+from meshy.backend.titan.vapo import whiten_advantages, clipped_value_error, critic_parameter_groups
+
+
+def row(values):
+    return {ADVANTAGE_TOKENS: torch.tensor(values, dtype=torch.float32),
+            'mask_assistant': torch.tensor([0] + [1] * (len(values) - 1))}
+
+
+def distributed_whiten(rank, rendezvous):
+    dist.init_process_group('gloo', init_method='file://' + rendezvous, rank=rank, world_size=4)
+    try:
+        # Two DP slices, each replicated on two CP ranks.
+        sample = row([1., 2., 99.] if rank < 2 else [4., 8., 99.])
+        whiten_advantages([sample], 3, 'cpu', NS(get_group=lambda: dist.group.WORLD), 2)
+        all_values = torch.tensor([1., 2., 4., 8.])
+        expected = (all_values - all_values.mean()) / (all_values.var() + 1e-8).sqrt()
+        torch.testing.assert_close(sample[ADVANTAGE_TOKENS][:2], expected[:2] if rank < 2 else expected[2:])
+        assert sample[ADVANTAGE_TOKENS][-1] == 0
+    finally:
+        dist.destroy_process_group()
 
 
 class VapoAlignment(unittest.TestCase):
+    def test_whitening_masks_and_constant(self):
+        sample = row([2., 4., 1000.])
+        whiten_advantages([sample], 3, 'cpu')
+        torch.testing.assert_close(sample[ADVANTAGE_TOKENS], torch.tensor([-2**-.5, 2**-.5, 0.]))
+        sample = row([2., 2., 1000.])
+        whiten_advantages([sample], 3, 'cpu')
+        self.assertEqual(sample[ADVANTAGE_TOKENS].abs().sum(), 0)
+        whiten_advantages([], 3, 'cpu')
+
+    def test_distributed_whitening_counts_unique_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(distributed_whiten, args=(os.path.join(directory, 'rendezvous'),), nprocs=4)
+
     def test_value_clipping_gradient_and_old_snapshot(self):
         old = torch.tensor([0., 0.], requires_grad=True)
         values = torch.tensor([0.5, -0.5], requires_grad=True)

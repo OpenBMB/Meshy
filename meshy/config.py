@@ -181,6 +181,7 @@ class TrainerParamsConfig:
     # (``meshy.backend.titan.critic.gae``); moving it here is what lets the
     # advantage stay per-token all the way into the PPO ratio.
     enable_gae: bool = False
+    normalize_advantages: bool = False
     gae_gamma: float = 1.0
     # VAPO length-adaptive lambda: lambda_i = 1 - 1/(alpha * L_i). Ignored when
     # ``gae_lambda`` pins a constant instead.
@@ -190,6 +191,8 @@ class TrainerParamsConfig:
     def __post_init__(self) -> None:
         if self.entropy_chunk_size <= 0:
             raise ValueError("entropy_chunk_size must be positive")
+        if self.normalize_advantages and not self.enable_gae:
+            raise ValueError("normalize_advantages requires enable_gae")
         if not 0.0 <= self.gae_gamma <= 1.0:
             raise ValueError(f"gae_gamma must be within [0, 1], got {self.gae_gamma!r}")
         if self.gae_alpha <= 0:
