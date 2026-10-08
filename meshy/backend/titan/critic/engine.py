@@ -66,6 +66,8 @@ class CriticEngine:
         dump_folder: str = "./outputs/critic",
         lr: float = 1e-5,
         warmup_steps: int = 0,
+        optimizer_kwargs: dict | None = None,
+        value_clip: float | None = None,
         max_norm: float | None = None,
         train_backbone: bool = False,
         model_spec: Any = None,
@@ -155,7 +157,20 @@ class CriticEngine:
 
         # Critic-only optimiser over whatever is trainable.
         trainable = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(trainable, lr=lr)
+        optimizer_params = trainable
+        if optimizer_kwargs is not None:
+            from ..vapo import critic_parameter_groups
+            options = dict(optimizer_kwargs)
+            optimizer_params = critic_parameter_groups(model, options.pop("weight_decay", 0.01))
+        else:
+            options = {}
+        self.optimizer = torch.optim.AdamW(optimizer_params, lr=lr, **options)
+        # Explicit recipe options are authoritative when resuming, including
+        # when an older checkpoint used a different parameter grouping.
+        self.restore_optimizer_config = optimizer_kwargs is not None
+        if value_clip is not None and value_clip <= 0:
+            raise ValueError("value_clip must be positive")
+        self.value_clip = value_clip
         self.base_lr = float(lr)
         self.warmup_steps = int(warmup_steps)
         # ``TrainingConfig.max_norm`` was previously accepted and ignored.
@@ -285,6 +300,11 @@ class CriticEngine:
         and backbone are the critic's learned state, and re-running the base
         model load over them would silently throw away every window of value
         training the checkpoint exists to preserve.
+
+        With explicit ``optimizer_kwargs``, restore per-parameter Adam state
+        but retain the current grouping and hyperparameters. The caller
+        restores ``train_steps`` separately; the next value step recomputes
+        warmup LR from that position and the configured base LR.
         """
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import set_state_dict
@@ -292,7 +312,18 @@ class CriticEngine:
         if not os.path.isdir(path):
             raise FileNotFoundError(f"Not a critic checkpoint directory: {path}")
         state = self._dcp_state()
+        current_groups = None
+        if getattr(self, "restore_optimizer_config", False):
+            # DCP optimizer tensors are keyed by parameter FQN, independently
+            # of param-group indices. Load those tensors strictly, but do not
+            # request old param_groups: a legacy checkpoint has only group 0,
+            # whereas the current decay/no-decay optimizer has two groups.
+            # Keeping the current groups also prevents saved beta/WD/epsilon
+            # values from silently overriding the explicit recipe settings.
+            current_groups = state["optim"].pop("param_groups")
         dcp.load(state, checkpoint_id=path)
+        if current_groups is not None:
+            state["optim"]["param_groups"] = current_groups
         set_state_dict(
             self.model,
             self.optimizer,
@@ -300,6 +331,12 @@ class CriticEngine:
             optim_state_dict=state["optim"],
         )
         logger.info("CriticEngine.load_state: restored value net + optimiser from {}", path)
+        if current_groups is not None:
+            logger.info(
+                "CriticEngine.load_state: retained {} configured optimizer groups "
+                "and hyperparameters; restored Adam moments and step by parameter name",
+                len(current_groups),
+            )
 
     def align_from_batch(self, batch: dict[str, torch.Tensor]) -> int:
         """Padded width ``make_batch`` must use for this batch to survive CP.
@@ -486,6 +523,7 @@ class CriticEngine:
         batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]],
         *,
         collect_values: bool = False,
+        old_values: list[torch.Tensor] | None = None,
     ) -> tuple[float, list[torch.Tensor]]:
         """Accumulate value gradients over several micro-batches.
 
@@ -513,6 +551,8 @@ class CriticEngine:
         """
         if not batches:
             raise ValueError("train_value_accumulated requires at least one batch")
+        if old_values is not None and len(old_values) != len(batches):
+            raise ValueError("old_values must match the value micro-batches")
 
         self.train_steps += 1
         self._apply_warmup()
@@ -535,7 +575,7 @@ class CriticEngine:
         local_numerator = torch.zeros((), device=self.device, dtype=torch.float32)
         collected: list[torch.Tensor] = []
 
-        for input_ids, positions, targets, mask, attention_masks in batches:
+        for batch_index, (input_ids, positions, targets, mask, attention_masks) in enumerate(batches):
             # Offline callers may keep the queued micro-batches on CPU so a
             # large effective mini-batch does not occupy GPU memory between
             # backward passes.
@@ -550,7 +590,13 @@ class CriticEngine:
                 values = self.model(
                     l_input, positions=l_pos, attention_masks=attention_masks
                 ).squeeze(-1)
-                numerator = ((values - l_targets) ** 2 * l_mask).sum()
+                from ..vapo import clipped_value_error
+                old = values.detach()
+                if old_values is not None:
+                    (old,) = self.sharder.shard_seq(old_values[batch_index].to(self.device))
+                numerator = (clipped_value_error(
+                    values, l_targets, old, self.value_clip
+                ) * l_mask).sum()
                 loss = numerator / denom
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite critic loss: {loss.item()}")

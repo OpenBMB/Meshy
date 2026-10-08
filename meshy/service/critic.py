@@ -59,6 +59,8 @@ class CriticService(SpmdService):
         actor_model_path: str | None = None,
         checkpoint: Any = None,
         resume_step: int = 0,
+        optimizer_kwargs: dict | None = None,
+        value_clip: float | None = None,
     ) -> None:
         super().__init__(
             name=name, role="critic", my_gpu=my_gpu, replica_gpus=replica_gpus,
@@ -73,6 +75,8 @@ class CriticService(SpmdService):
         self.max_tokens_per_micro = max_tokens_per_micro
         self.train_backbone = train_backbone
         self.lr = lr
+        self.optimizer_kwargs = optimizer_kwargs
+        self.value_clip = value_clip
         self.warmup_steps = warmup_steps
         self.cold_start_windows = cold_start_windows
         self.publish_gate_zero = publish_gate_zero
@@ -130,6 +134,8 @@ class CriticService(SpmdService):
             train_backbone=bool(config.train_backbone),
             lr=float(config.lr),
             warmup_steps=int(config.warmup_steps),
+            optimizer_kwargs=config.optimizer_kwargs,
+            value_clip=config.value_clip,
             cold_start_windows=int(config.cold_start_windows),
             publish_gate_zero=bool(config.publish_gate_zero),
             value_epochs=int(config.value_epochs),
@@ -179,6 +185,8 @@ class CriticService(SpmdService):
             train_backbone=self.train_backbone,
             lr=self.lr,
             warmup_steps=self.warmup_steps,
+            optimizer_kwargs=self.optimizer_kwargs,
+            value_clip=self.value_clip,
             value_epochs=self.value_epochs,
             gamma=self.gamma,
             alpha=self.alpha,

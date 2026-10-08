@@ -41,6 +41,8 @@ class CriticSpmdEngine(SpmdEngine):
         train_backbone: bool = True,
         lr: float = 5e-6,
         warmup_steps: int = 10,
+        optimizer_kwargs: dict | None = None,
+        value_clip: float | None = None,
         value_epochs: int = 1,
         gamma: float = 1.0,
         alpha: float = 1.5,
@@ -70,6 +72,8 @@ class CriticSpmdEngine(SpmdEngine):
         self.train_backbone = bool(train_backbone)
         self.lr = float(lr)
         self.warmup_steps = int(warmup_steps)
+        self.optimizer_kwargs = optimizer_kwargs
+        self.value_clip = value_clip
         self.value_epochs = int(value_epochs)
         self.gamma = float(gamma)
         self.alpha = float(alpha)
@@ -164,6 +168,8 @@ class CriticSpmdEngine(SpmdEngine):
             dump_folder=cfg.dump_folder,
             lr=self.lr,
             warmup_steps=self.warmup_steps,
+            optimizer_kwargs=self.optimizer_kwargs,
+            value_clip=self.value_clip,
             max_norm=self.max_norm,
             train_backbone=self.train_backbone,
             model_spec=spec,
@@ -356,7 +362,8 @@ class CriticSpmdEngine(SpmdEngine):
         window_values: list[torch.Tensor] = []
         for epoch in range(max(1, self.value_epochs)):
             loss, collected = self.critic.train_value_accumulated(
-                micro_batches, collect_values=(epoch == 0)
+                micro_batches, collect_values=(epoch == 0),
+                old_values=window_values if epoch > 0 and self.value_clip is not None else None,
             )
             losses.append(loss)
             if epoch == 0:
