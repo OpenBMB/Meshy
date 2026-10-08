@@ -66,6 +66,7 @@ class Batch:
     lengths: torch.Tensor                # [n_docs] int32, tokens per sample entering the forward
     n_docs: int                          # number of real samples
     attention_masks: Any = None          # VarlenMetadata for ``packed``; None for ``padded``
+    positive_lm_weights: torch.Tensor | None = None  # per-document, shaped-return gated
 
     @property
     def n_slots(self) -> int:
@@ -219,6 +220,13 @@ def build_micro_batch(
         lengths=lengths,
         n_docs=n_docs,
         attention_masks=attention_masks,
+        # Undiscounted terminal returns equal the shaped outcome reward.
+        # The trainer config rejects discounted GAE with this LM objective.
+        positive_lm_weights=torch.tensor([
+            float(samples[idx].get("positive_lm_weight", 0.0))
+            if float(samples[idx].get("reward", 0.0)) > 0.5 else 0.0
+            for idx in micro.sample_idx
+        ], device=device, dtype=torch.float32),
     )
 
 

@@ -134,6 +134,9 @@ def sample_to_tensordict(sample: Any, weight_version: int):
             ),
             "weight_version": torch.tensor(int(weight_version), dtype=torch.int64),
             "reward": torch.tensor(float(sample.reward), dtype=torch.float32),
+            "positive_lm_weight": torch.tensor(
+                float(getattr(sample, "positive_lm_weight", 0.0)), dtype=torch.float32
+            ),
             # Equal to ``reward`` when no shaping is configured; the column is
             # only written when the worker declares it.
             RAW_REWARD_FIELD: torch.tensor(
@@ -229,6 +232,7 @@ class RolloutWorker(TQWorker):
         advantage: str | Callable[[list[Any]], Any] | None = None,
         advantage_kwargs: dict[str, Any] | None = None,
         filter_zero_std_groups: bool = False,
+        publish_positive_lm_weights: bool = False,
         oversample_factor: float = 1.0,
         num_epochs: int = 1,
         pacing_window: int | str | None = 1,
@@ -292,6 +296,9 @@ class RolloutWorker(TQWorker):
         if self.reward_shaping_fn is not None:
             fields = fields + (RAW_REWARD_FIELD,)
         self.rollout_fields = fields
+        self.publish_positive_lm_weights = publish_positive_lm_weights
+        if publish_positive_lm_weights:
+            self.rollout_fields = fields + ("positive_lm_weight",)
         self.advantage_kwargs = dict(advantage_kwargs or {})
         self.filter_zero_std_groups = bool(filter_zero_std_groups)
         if oversample_factor < 1.0:
@@ -556,6 +563,9 @@ class RolloutWorker(TQWorker):
             return sample
 
         group = await asyncio.gather(*(rollout_one(sample) for sample in group))
+        if getattr(self, "publish_positive_lm_weights", False):
+            from meshy.utils.positive_lm import assign_positive_lm_weights
+            assign_positive_lm_weights(group)
         self.groups_seen += 1
         if self.filter_zero_std_groups:
             rewards = [float(sample.reward) for sample in group]

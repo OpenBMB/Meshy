@@ -47,6 +47,7 @@ FIELD_KINDS: dict[str, str] = {
     # ``R`` the critic and GAE consume, ``raw_reward`` the unshaped task
     # reward the solve-rate metrics need.
     "raw_reward": "scalar",
+    "positive_lm_weight": "scalar",
     # PPO critic: per-token value function V(s_t) published by a critic
     # Service, which the trainer turns into GAE advantages
     # (``TrainerParamsConfig.enable_gae``). Same length as ``tokens``.
@@ -72,6 +73,7 @@ FIELD_KINDS: dict[str, str] = {
 _SCALAR_DTYPE: dict[str, torch.dtype] = {
     "reward": torch.float32,
     "raw_reward": torch.float32,
+    "positive_lm_weight": torch.float32,
     "advantage": torch.float32,
     "weight_version": torch.int64,
     "truncated": torch.int64,

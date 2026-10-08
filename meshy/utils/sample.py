@@ -29,6 +29,7 @@ class Sample:
     #: generation was aborted and resumed after a weight update, so the
     #: response mixes tokens from more than one policy version
     mixed_version: bool = False
+    positive_lm_weight: float = 0.0
 
 
 class SampleBuilder:
