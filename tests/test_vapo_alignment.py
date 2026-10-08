@@ -4,13 +4,16 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from meshy.backend.titan.batch import ADVANTAGE_TOKENS
+from meshy.backend.titan.batch import ADVANTAGE_TOKENS, Batch, build_micro_batch
+from meshy.backend.titan.plan import MiniPlan
 from meshy.backend.titan.vapo import whiten_advantages, clipped_value_error, critic_parameter_groups
+from meshy.utils.positive_lm import assign_positive_lm_weights
 
 
 def row(values):
@@ -83,56 +86,80 @@ class VapoAlignment(unittest.TestCase):
         first, old = CriticEngine.train_value_accumulated(stub, [batch, batch], collect_values=True)
         self.assertAlmostEqual(first, 1.)
         self.assertAlmostEqual(model.weight.item(), .5)
-        self.assertAlmostEqual(old[0].abs().sum().item(), 0.)
         second, _ = CriticEngine.train_value_accumulated(stub, [batch, batch], old_values=old)
         self.assertAlmostEqual(second, .64, places=6)
         self.assertAlmostEqual(model.weight.item(), .5)
         self.assertEqual(old[0].abs().sum().item(), 0.)
 
-    def test_icepop_masks_off_policy_tokens(self):
-        from meshy.backend.titan.batch import Batch
-        from meshy.backend.titan.plan import MiniPlan
+    def test_group_weights_shaping_and_transport(self):
+        from meshy.worker.rollout import sample_to_tensordict
+        from meshy.utils.sample import Sample
+        group = [Sample([], [1, 2, 3], [-1.] * 3, [0, 1, 1], '', r, 0., raw_reward=raw)
+                 for r, raw in [(1., 1.), (.4, 1.), (0., 0.), (0., 0.)]]
+        assign_positive_lm_weights(group)
+        self.assertEqual([s.positive_lm_weight for s in group], [.5, .5, 0., 0.])
+        samples = [sample_to_tensordict(s, 0) for s in reversed(group)]
+        from meshy.transferqueue.adapter import samples_to_td, td_to_samples
+        fields = ('tokens', 'logprobs', 'mask_assistant', 'reward', 'positive_lm_weight')
+        packed = samples_to_td(samples, fields)
+        self.assertEqual(packed['positive_lm_weight'].dtype, torch.float32)
+        samples = td_to_samples(packed, fields)
+        micro = NS(sample_idx=(3, 2, 0), doc_lens=(3, 3, 3), n_rows=3, seq_len=4)
+        batch = build_micro_batch(samples, micro, layout='padded', device=torch.device('cpu'),
+                                  sharder=NS(enabled=False, shard_seq=lambda *xs: xs), need_rollout_lp=True)
+        torch.testing.assert_close(batch.positive_lm_weights, torch.tensor([.5, 0., 0.]))
+        for rewards in ([1., 1.], [0., 0.], [.2, 1.]):
+            group = [NS(reward=r, raw_reward=None) for r in rewards]
+            assign_positive_lm_weights(group)
+            self.assertEqual([s.positive_lm_weight for s in group], [0., 0.])
+
+    def test_icepop_and_positive_lm_gradient(self):
         from meshy.backend.titan.trainer import TitanTrainer
         stub = NS(ppo_clip_eps_low=.2, ppo_clip_eps_high=.28, use_tis=True, use_icepop=True,
                   tis_ratio_min=.5, tis_ratio_max=5., calculate_per_token_loss=True,
-                  old_logprobs_source='train',
+                  positive_lm_loss_coef=.1, old_logprobs_source='train',
                   sharder=NS(all_reduce_sum=lambda x: x), parallel_dims=NS(cp=1))
         old = torch.full((1, 3), -2.)
         new = old.clone().requires_grad_()
         batch = Batch(torch.zeros(1, 3, dtype=torch.long), torch.zeros(1, 3, dtype=torch.long),
                       torch.zeros(1, 3, dtype=torch.int32), torch.ones(1, 3),
                       torch.zeros(1, 3, dtype=torch.long), torch.ones(1),
-                      old - torch.tensor([[2., 6., .25]]).log(), torch.tensor([3]), 1)
+                      old - torch.tensor([[2., 6., .25]]).log(), torch.tensor([3]), 1,
+                      positive_lm_weights=torch.tensor([.5]))
         mini = MiniPlan(micros=(), n_docs_global=1, n_tokens_global=3, tokens_per_rank=(3,))
         loss, sums = TitanTrainer._ppo_clip_loss(stub, new, old, batch, mini)
-        self.assertAlmostEqual(float(loss.detach()), -2 / 3, places=6)
+        self.assertAlmostEqual(float(loss.detach()), -2 / 3 + .1, places=6)
         self.assertEqual(float(sums['tis_masked_sum']), 2.)
         self.assertEqual(float(sums['ratio_sum']), 3.)
         loss.backward()
-        torch.testing.assert_close(new.grad, torch.tensor([[-2. / 3, 0., 0.]]))
+        torch.testing.assert_close(new.grad, torch.tensor([[-2.05 / 3, -.05 / 3, -.05 / 3]]))
 
+        # Both inclusive IcePop bounds survive; LM uses the same reduction
+        # as PG in sequence-mean mode too.
         stub.calculate_per_token_loss = False
         batch.rollout_logprobs = old - torch.tensor([[.5, 5., 1.]]).log()
         loss, sums = TitanTrainer._ppo_clip_loss(stub, old.clone().requires_grad_(), old, batch, mini)
         self.assertEqual(float(sums['tis_masked_sum']), 0.)
-        self.assertAlmostEqual(float(loss.detach()), -6.5 / 3, places=6)
+        self.assertAlmostEqual(float(loss.detach()), -6.5 / 3 + .1, places=6)
 
+        # Legacy recipes retain their original unweighted PPO objective.
         stub.use_icepop = False
+        stub.positive_lm_loss_coef = 0.
         loss, sums = TitanTrainer._ppo_clip_loss(stub, old, old, batch, mini)
         self.assertAlmostEqual(float(loss), -1.)
 
-    def test_metric_tags_separate_ois_and_tis(self):
+    def test_metric_tags_separate_ppo_and_tis(self):
         from meshy.backend.titan.metrics import TitanTrainer
         metrics = TitanTrainer._training_metrics(NS(), {
-            'ratio_mean': 1.1, 'tis_ratio_mean': 1.4, 'pg_loss': -.2,
+            'ratio_mean': 1.1, 'tis_ratio_mean': 1.4,
+            'pg_loss': -.2, 'total_loss': -.1, 'positive_lm_loss': 1.,
         })
         self.assertEqual(metrics['train/ois'], 1.1)
         self.assertEqual(metrics['train/tis'], 1.4)
         self.assertEqual(metrics['train/pg_loss'], -.2)
-        self.assertEqual(metrics['train/loss'], -.2)
+        self.assertEqual(metrics['train/loss'], -.1)
 
     def test_window_snapshot_precedes_all_updates(self):
-        from unittest.mock import patch
         from meshy.backend.titan.trainer import TitanTrainer
         events = []
         plans = [NS(micros=()), NS(micros=())]

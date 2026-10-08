@@ -168,6 +168,7 @@ class TrainerParamsConfig:
     # IcePop uses train-old / rollout weights; legacy TIS masks new / old.
     # Enabling this also freezes train-old logprobs across a complete window.
     use_icepop: bool = False
+    positive_lm_loss_coef: float = 0.0
     tis_ratio_min: float = 0.5
     tis_ratio_max: float = 5.0
     logprob_chunk_size: int = 1024
@@ -196,8 +197,12 @@ class TrainerParamsConfig:
             raise ValueError("entropy_chunk_size must be positive")
         if self.use_icepop and self.old_logprobs_source != "train":
             raise ValueError("IcePop requires old_logprobs_source='train'")
+        if self.positive_lm_loss_coef < 0:
+            raise ValueError("positive_lm_loss_coef must be nonnegative")
         if self.normalize_advantages and not self.enable_gae:
             raise ValueError("normalize_advantages requires enable_gae")
+        if self.positive_lm_loss_coef and self.enable_gae and self.gae_gamma != 1.0:
+            raise ValueError("Positive LM reward gating requires undiscounted returns (gae_gamma=1)")
         if not 0.0 <= self.gae_gamma <= 1.0:
             raise ValueError(f"gae_gamma must be within [0, 1], got {self.gae_gamma!r}")
         if self.gae_alpha <= 0:
@@ -329,6 +334,7 @@ class RolloutServiceConfig(ServiceConfig):
     advantage: str | Callable[[list[Any]], Any] | None = None
     advantage_kwargs: dict[str, Any] = field(default_factory=dict)
     filter_zero_std_groups: bool = False
+    publish_positive_lm_weights: bool = False
     #: Cap on how much a run may oversample to replace groups that
     #: ``filter_zero_std_groups`` dropped, as a multiple of the dataset. 1.0
     #: disables replacement (a dropped group is simply lost, shortening the

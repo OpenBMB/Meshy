@@ -331,6 +331,8 @@ class TitanTrainer(_BackendTitanTrainer):
             # ``log_ratio_abs_mean`` for how far off-policy the batch is.
             "ratio_mean": ("train/ois", "train/tis"),
             "tis_ratio_mean": "train/tis",
+            "positive_lm_loss": "train/positive_lm_loss",
+            "total_loss": "train/loss",
             "clip_frac": "train/pg_clipfrac",
             "tis_masked_frac": ("train/tis_masked_token_ratio", "train/tis_clipfrac"),
             "ppo_kl": "train/ppo_kl",

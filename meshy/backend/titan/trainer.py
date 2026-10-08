@@ -124,6 +124,7 @@ class TitanTrainer(ForgeEngine):
         calculate_per_token_loss: bool = False,
         use_tis: bool = False,
         use_icepop: bool = False,
+        positive_lm_loss_coef: float = 0.0,
         tis_ratio_min: float = 0.5,
         tis_ratio_max: float = 5.0,
         logprob_chunk_size: int = 1024,
@@ -162,6 +163,7 @@ class TitanTrainer(ForgeEngine):
         self.calculate_per_token_loss = bool(calculate_per_token_loss)
         self.use_tis = bool(use_tis)
         self.use_icepop = bool(use_icepop)
+        self.positive_lm_loss_coef = float(positive_lm_loss_coef)
         self.tis_ratio_min = float(tis_ratio_min)
         self.tis_ratio_max = float(tis_ratio_max)
         if self.use_tis and not (0.0 < self.tis_ratio_min <= self.tis_ratio_max):
@@ -772,6 +774,12 @@ class TitanTrainer(ForgeEngine):
         else:
             tis_mask = torch.ones_like(ratio, dtype=torch.bool)
         pg_per_token = pg_per_token * mask
+        positive_per_token = torch.zeros_like(pg_per_token)
+        if getattr(self, "positive_lm_loss_coef", 0.0):
+            if mb.positive_lm_weights is None:
+                raise ValueError("Positive LM loss requires group weights")
+            weights = torch.cat([mb.positive_lm_weights, new_lp.new_zeros(1)])[mb.doc_ids]
+            positive_per_token = -new_lp * weights * mask
 
         flat_ids = mb.doc_ids.reshape(-1)
         seg_sum = pg_per_token.new_zeros(mb.n_slots).index_add_(
@@ -787,11 +795,22 @@ class TitanTrainer(ForgeEngine):
                 1, mini.n_docs_global
             )
 
+        positive_seg = positive_per_token.new_zeros(mb.n_slots).index_add_(
+            0, flat_ids, positive_per_token.reshape(-1)
+        )
+        if self.calculate_per_token_loss:
+            positive_loss = positive_seg[:n].sum() / max(1, mini.n_tokens_global)
+        else:
+            positive_loss = (positive_seg[:n] / seg_cnt_global[:n].clamp(min=1)).sum() / max(1, mini.n_docs_global)
+        pg_loss = loss
+        loss = loss + getattr(self, "positive_lm_loss_coef", 0.0) * positive_loss
         with torch.no_grad():
             ratio_d = ratio.detach()
             log_ratio_d = log_ratio.detach()
             sums = {
-                "loss": loss.detach(),
+                "loss": pg_loss.detach(),
+                "total_loss": loss.detach(),
+                "positive_lm_loss": positive_loss.detach(),
                 "tis_ratio_sum": (tis_ratio * mask).sum(),
                 "ratio_sum": (ratio_d * mask).sum(),
                 "clip_sum": (((ratio_d < 1 - self.ppo_clip_eps_low) | (ratio_d > 1 + self.ppo_clip_eps_high)).float() * mask).sum(),
@@ -1021,6 +1040,8 @@ class TitanTrainer(ForgeEngine):
             out["entropy"] = values["entropy_sum"] / tokens
         if "tis_ratio_sum" in values:
             out["tis_ratio_mean"] = values["tis_ratio_sum"] / tokens
+            out["positive_lm_loss"] = values["positive_lm_loss"]
+            out["total_loss"] = values["total_loss"]
         return out
 
     def _aggregate_metrics(

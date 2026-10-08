@@ -64,6 +64,7 @@ def _build_rollout_worker(
         advantage=kwargs.get("advantage"),
         advantage_kwargs=kwargs.get("advantage_kwargs", {}),
         filter_zero_std_groups=bool(kwargs.get("filter_zero_std_groups", False)),
+        publish_positive_lm_weights=bool(kwargs.get("publish_positive_lm_weights", False)),
         oversample_factor=float(kwargs.get("oversample_factor", 1.0) or 1.0),
         num_epochs=int(kwargs.get("num_epochs", 1)),
         pacing_window=kwargs.get("pacing_window", 1),
