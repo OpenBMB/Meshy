@@ -17,13 +17,13 @@ Recipe conformance (``justrl_ii_recipe.md``):
 | lr | 1e-6 constant, adam eps 1e-8 | same |
 | sampling | T=1.0, top_p=1.0 | same |
 | clip-higher | 0.2 / 0.28 | same |
-| TIS | on | `use_tis=True` |
+| TIS / IcePop | [0.5, 5.0] | train-old / rollout weighting |
 | KL | none (kl_coef=0) | no reference model at all |
 | critic cold start | ~30 windows, actor frozen | `COLD_START_WINDOWS` |
 | nodes | actor 2 · critic 2 (32×H800) | 8×H800, serial colocate |
 | overlong soft penalty | buffer 25395, f=1.0 | `reward_shaping` |
-| dynamic sampling + 2× oversample | on | `filter_zero_std_groups` (off, see there) |
-| positive_lm_loss | 0.1 | **absent** |
+| dynamic sampling + 2× oversample | on | `filter_zero_std_groups=True` |
+| positive_lm_loss | 0.1 | raw-group difficulty weighted, shaped reward > 0.5 |
 | in-loop eval | every 5 steps, AIME ×3 ×4 | **absent -- read this first** |
 | ckpt | every 10 steps, rotated | `CHECKPOINT`, see §"Disk" |
 | partial rollout | on | on, via SGLang abort/continue |
@@ -71,8 +71,8 @@ are all that same number, so the three stages advance in lockstep.
                     clears the rows itself and raises the gen gate;
                     the trainer never sees a row and the actor never steps
     window 31+      rollout → critic (score with the pre-update V, publish
-                    `values`, then one value step) → trainer (GAE, then 5
-                    optimiser steps) → HF weight export → SGLang reload → gate
+                    `values`, then one value step) → trainer (GAE, then one
+                    optimiser step) → HF weight export → SGLang reload → gate
 
 Gate stream: `0` (trainer genesis, never offset) → `1..30` (critic cold start)
 → `31..` (trainer, offset by `critic_cold_start_windows`). The rollout runs
@@ -84,21 +84,21 @@ requests are aborted and resumed across each colocation hand-off — see
 
 Update granularity is *derived*, not declared, so it is spelled out here:
 `dp("batch") = dp_replicate × dp_shard = 2` (CP does not enter the batch mesh),
-so `n_local = 480/2 = 240` and `mini_batch_size=48` gives
-`n_mini = 5` — **5 optimiser steps per window, each over 48×2 = 96 samples**.
-Changing `dp_shard_degree` silently changes the PPO update schedule. One
-update per window would make clip-higher inert (with
-`old_logprobs_source="rollout"` the policy has not moved inside the update, so
-only the train/inference logprob gap — the thing TIS covers — reaches the
-clip); five keeps §1's clip-higher load-bearing without shrinking an update to
-a single prompt group.
+so `n_local = 480/2 = 240` and `mini_batch_size=480` gives
+`n_mini = 1` — **one optimiser step per window over all 480 global samples**.
+The mini-batch size is a per-rank limit; the final batch can be smaller.
+Actor micro-batches use `batch_layout="padded"` with a 65536-token budget:
+multiple short samples share a forward and are padded to its longest row,
+while a sample longer than the budget runs alone. This controls forward
+memory and gradient accumulation without adding optimiser steps.
+
 
 The critic's own tempo: `max_tokens_per_micro` bounds the tokens resident on
 the GPU per forward, *not* the update granularity — `engine/critic.py` feeds
 the whole window to `train_value_accumulated`, so the critic takes
 `value_epochs` steps per window. That is what makes §2's markers legible:
-`warmup_steps=10` is 10 rollout steps, and "value_loss enters its normal range
-after ~25 steps" is 25 windows.
+`warmup_steps=0` on the continuation means the restored critic starts at its saved
+learning rate; the value net is loaded without another optimizer warmup.
 
 The window is also split across the critic's DP mesh (`dp_shard_degree=2`), so
 each rank fits 240 of the 480 rows and the two shards' gradients meet in FSDP's
@@ -154,11 +154,7 @@ Not implemented
   degradation is invisible to every training-side metric, so the peak ckpt can
   only be selected by in-loop eval. There is no eval role in `meshy/service/`,
   so this run produces no basis for choosing a checkpoint.
-- **positive_lm_loss** and the three §2 gauges as dashboard metrics (they are
-  loguru-only) are absent.
-- **dynamic sampling** is implemented but off here; see
-  `filter_zero_std_groups` in `_rollout_group` for why that is a choice rather
-  than a gap.
+- The three §2 gauges as dashboard metrics (they are loguru-only) are absent.
 
 What a resume does *not* recover: TransferQueue is RAM-only, so every row in
 flight at the checkpoint is lost, and the rollout restarts from the prompt
@@ -240,8 +236,8 @@ NUM_STEPS = 600
 #: worse than no baseline). With the head zero-initialised the opening loss is
 #: E[R^2] ~ 0.55 and the whole budget goes on learning, so the reference
 #: implementation cut the same knob to 20 (miles phx_0711_ppo b83c97dc5,
-#: measured out-of-warmup by step 17-18; `--critic-lr-warmup-iters 10` is
-#: unchanged, and so is `warmup_steps` below). The env override exists so the
+#: measured out-of-warmup by step 17-18. Continuation runs load the saved
+#: critic directly and set `warmup_steps=0`. The env override exists so the
 #: cold-start -> publish transition can be reached quickly in a smoke run.
 COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "20"))
 CRITIC_SCORE_BATCH = int(os.environ.get("XRL_CRITIC_SCORE_BATCH", str(BATCH_SIZE)))
@@ -298,8 +294,9 @@ def _actor_trainer_config() -> TrainerConfig:
         # fp32 master weights; bf16 matmuls (mixed_precision_param default).
         dtype="float32",
         compile_model=True,
-        # 32k tokens/rank x 42 layers does not fit next to the 130k-vocab LM
-        # head under per-op SAC.
+        # A single 131072-token row is already validated on this training path;
+        # the padded budget is set to that same length so short rows can share
+        # a forward without making a microbatch larger than the known peak.
         activation_checkpoint_mode="full",
         # 8 GPUs: CP4 × FSDP2.
         dp_shard_degree=2,
@@ -345,19 +342,25 @@ def _critic_trainer_config() -> TrainerConfig:
 
 def _trainer_params() -> TrainerParamsConfig:
     return TrainerParamsConfig(
-        # 480 rows / dp(2) = 240 local rows, so this yields 5 optimiser steps
-        # per window over 96 samples each. See "Run tempo" in the module
-        # docstring -- this number, not `batch_size`, sets the PPO update
-        # schedule, and it moves when `dp_shard_degree` does.
-        mini_batch_size=48,
-        micro_batch_size=1,
+        # Per-rank limit: all 240 local rows fit in one mini-batch, giving
+        # one optimiser update over the full 480-row rollout window.
+        mini_batch_size=480,
+        # Token-budget batching overrides the default micro_batch_size row
+        # limit. CP4 uses padded SDPA; short samples share a forward, with
+        # rows padded to the longest sequence (aligned to seq_bucket).
+        batch_layout="padded",
+        # 131072 OOMs during the actor PPO backward with padded SDPA; keep
+        # the same layout and mini-batch while halving the peak token budget.
+        max_tokens_per_micro=65536,
         ppo_clip_eps_low=0.2,
         ppo_clip_eps_high=0.28,
-        old_logprobs_source="rollout",
+        old_logprobs_source="train",
         calculate_per_token_loss=True,
-        # §1 TIS: the train/inference logprob mismatch fuse. Near-zero load in
-        # practice (tis ~ 1.000).
+        # Freeze the whole window's train-old logprobs before its update;
+        # IcePop weights PG by train-old / rollout, while PPO uses new / old.
         use_tis=True,
+        use_icepop=True,
+        positive_lm_loss_coef=0.1,
         tis_ratio_min=0.5,
         tis_ratio_max=5.0,
         logprob_chunk_size=2048,
@@ -365,11 +368,12 @@ def _trainer_params() -> TrainerParamsConfig:
         # V per token; the trainer walks
         #   delta[t] = R[t] + gamma*V[t+1] - V[t]
         #   A[t]     = delta[t] + gamma*lambda*A[t+1],  lambda = 1 - 1/(alpha*L)
-        # and feeds A straight into the PPO ratio *per token*. Reducing it to
+        # and globally whitens A before PPO, retaining it *per token*. Reducing it to
         # one scalar per sequence (the critic's `publish_mode="advantage"`)
         # would throw away exactly the within-sequence credit assignment the
         # value baseline exists to provide.
         enable_gae=True,
+        normalize_advantages=True,
         gae_gamma=1.0,
         # §1: alpha must match the response length; the paper's 0.05 collapses
         # the credit half-life to ~500 tokens at 15k. Same value the critic's
@@ -438,6 +442,10 @@ def _inference_group() -> ServiceGroup:
                 "max_total_tokens": 1200000,
                 "schedule_conservativeness": 1.2,
                 "enable_memory_saver": True,
+                # SGLang's synthetic startup warmup can return 502 while the
+                # eight colocated replicas are booting together; Meshy's
+                # readiness check and the first rollout request are sufficient.
+                "skip_server_warmup": True,
             },
         ),
     )
@@ -459,7 +467,7 @@ def _training_group() -> ServiceGroup:
             # trainer builds the advantage itself. `values` is now the column
             # whose absence holds a row back until the critic has scored it,
             # and `raw_reward` carries the pre-shaping reward for the metrics.
-            tq_fields=list(GAE_TRAINER_FIELDS_SHAPED),
+            tq_fields=list(GAE_TRAINER_FIELDS_SHAPED) + ["positive_lm_weight"],
             timer_enabled=True,
             # Keeps the rollout's gate stream monotonic across the hand-off
             # from the critic (which paces during cold start) to the trainer.
@@ -507,16 +515,16 @@ def _critic_group() -> ServiceGroup:
             #
             # This bounds memory only -- the value step still accumulates over
             # the whole window and takes a single optimiser step.
-            max_tokens_per_micro=65536,
+            max_tokens_per_micro=131072,
             # §2: a value-head-only critic is a linear probe on frozen
             # features and plateaus before it beats the whitening baseline.
             train_backbone=True,
             lr=5e-6,
-            # §2: 10-iter lr warmup absorbs the cold-start value_loss spike
-            # (peak ~32) without moving the head a long way on it. The critic
-            # takes one step per window, so this is 10 rollout steps -- the
-            # unit §2 counts in.
-            warmup_steps=10,
+            optimizer_kwargs={"betas": (0.9, 0.98), "eps": 1e-8, "weight_decay": 0.1},
+            value_clip=0.2,
+            # Continuation runs restore the critic optimizer and value net;
+            # do not apply another learning-rate warmup after that restore.
+            warmup_steps=0,
             cold_start_windows=COLD_START_WINDOWS,
             # Optimiser steps per window. 1 keeps the critic's clock equal to
             # the rollout's, which is what makes §2's "~25 steps to normal
@@ -595,12 +603,7 @@ def _rollout_group() -> ServiceGroup:
             # This is also what rules the overlong penalty out -- it forces
             # `advantage_fn = None` and skips `meshy/advantage.py` entirely.
             external_advantage=True,
-            # §1 dynamic sampling. Off by default *here* and not an oversight:
-            # with a value baseline a zero-variance group still carries a
-            # gradient (recipe §1 is why PPO replaced GRPO), so dropping one
-            # trades data for compute rather than rescuing a dead batch.
-            #
-            # Turning it on gives §1's arrangement: the filter drops
+            # §1 dynamic sampling, including critic cold start: the filter drops
             # all-pass/all-fail groups (judged on `raw_reward`, so the length
             # penalty cannot fake variance) and `oversample_factor` bounds how
             # far the epoch may over-run replacing them. Replacement is
@@ -608,7 +611,8 @@ def _rollout_group() -> ServiceGroup:
             # the dropped one and every consumer takes a fixed row count off
             # TQ, so a window still fills; the factor only stops a stretch of
             # uniformly-solved prompts from burning the dataset.
-            filter_zero_std_groups=False,
+            filter_zero_std_groups=True,
+            publish_positive_lm_weights=True,
             oversample_factor=2.0,
             checkpoint=CHECKPOINT,
         ),
