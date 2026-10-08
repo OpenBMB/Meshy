@@ -165,6 +165,9 @@ class TrainerParamsConfig:
     old_logprobs_source: Literal["rollout", "train"] = "rollout"
     calculate_per_token_loss: bool = False
     use_tis: bool = False
+    # IcePop uses train-old / rollout weights; legacy TIS masks new / old.
+    # Enabling this also freezes train-old logprobs across a complete window.
+    use_icepop: bool = False
     tis_ratio_min: float = 0.5
     tis_ratio_max: float = 5.0
     logprob_chunk_size: int = 1024
@@ -191,6 +194,8 @@ class TrainerParamsConfig:
     def __post_init__(self) -> None:
         if self.entropy_chunk_size <= 0:
             raise ValueError("entropy_chunk_size must be positive")
+        if self.use_icepop and self.old_logprobs_source != "train":
+            raise ValueError("IcePop requires old_logprobs_source='train'")
         if self.normalize_advantages and not self.enable_gae:
             raise ValueError("normalize_advantages requires enable_gae")
         if not 0.0 <= self.gae_gamma <= 1.0:

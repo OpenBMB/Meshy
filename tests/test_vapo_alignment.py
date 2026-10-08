@@ -89,6 +89,69 @@ class VapoAlignment(unittest.TestCase):
         self.assertAlmostEqual(model.weight.item(), .5)
         self.assertEqual(old[0].abs().sum().item(), 0.)
 
+    def test_icepop_masks_off_policy_tokens(self):
+        from meshy.backend.titan.batch import Batch
+        from meshy.backend.titan.plan import MiniPlan
+        from meshy.backend.titan.trainer import TitanTrainer
+        stub = NS(ppo_clip_eps_low=.2, ppo_clip_eps_high=.28, use_tis=True, use_icepop=True,
+                  tis_ratio_min=.5, tis_ratio_max=5., calculate_per_token_loss=True,
+                  old_logprobs_source='train',
+                  sharder=NS(all_reduce_sum=lambda x: x), parallel_dims=NS(cp=1))
+        old = torch.full((1, 3), -2.)
+        new = old.clone().requires_grad_()
+        batch = Batch(torch.zeros(1, 3, dtype=torch.long), torch.zeros(1, 3, dtype=torch.long),
+                      torch.zeros(1, 3, dtype=torch.int32), torch.ones(1, 3),
+                      torch.zeros(1, 3, dtype=torch.long), torch.ones(1),
+                      old - torch.tensor([[2., 6., .25]]).log(), torch.tensor([3]), 1)
+        mini = MiniPlan(micros=(), n_docs_global=1, n_tokens_global=3, tokens_per_rank=(3,))
+        loss, sums = TitanTrainer._ppo_clip_loss(stub, new, old, batch, mini)
+        self.assertAlmostEqual(float(loss.detach()), -2 / 3, places=6)
+        self.assertEqual(float(sums['tis_masked_sum']), 2.)
+        self.assertEqual(float(sums['ratio_sum']), 3.)
+        loss.backward()
+        torch.testing.assert_close(new.grad, torch.tensor([[-2. / 3, 0., 0.]]))
+
+        stub.calculate_per_token_loss = False
+        batch.rollout_logprobs = old - torch.tensor([[.5, 5., 1.]]).log()
+        loss, sums = TitanTrainer._ppo_clip_loss(stub, old.clone().requires_grad_(), old, batch, mini)
+        self.assertEqual(float(sums['tis_masked_sum']), 0.)
+        self.assertAlmostEqual(float(loss.detach()), -6.5 / 3, places=6)
+
+        stub.use_icepop = False
+        loss, sums = TitanTrainer._ppo_clip_loss(stub, old, old, batch, mini)
+        self.assertAlmostEqual(float(loss), -1.)
+
+    def test_metric_tags_separate_ois_and_tis(self):
+        from meshy.backend.titan.metrics import TitanTrainer
+        metrics = TitanTrainer._training_metrics(NS(), {
+            'ratio_mean': 1.1, 'tis_ratio_mean': 1.4, 'pg_loss': -.2,
+        })
+        self.assertEqual(metrics['train/ois'], 1.1)
+        self.assertEqual(metrics['train/tis'], 1.4)
+        self.assertEqual(metrics['train/pg_loss'], -.2)
+        self.assertEqual(metrics['train/loss'], -.2)
+
+    def test_window_snapshot_precedes_all_updates(self):
+        from unittest.mock import patch
+        from meshy.backend.titan.trainer import TitanTrainer
+        events = []
+        plans = [NS(micros=()), NS(micros=())]
+        def snapshot(samples, mini):
+            events.append('snapshot')
+            return [torch.tensor(0.)]
+        def update(samples, mini, timer, old):
+            events.append('update')
+            self.assertEqual(float(old[0]), 0.)
+            return {}, None
+        stub = NS(timer_enabled=False, enable_gae=False, old_logprobs_source='train',
+                  use_icepop=True,
+                  _compute_old_logprobs_train=snapshot, _run_mini_batch=update,
+                  lr_schedulers=NS(step=lambda: None), step=0, batch_layout='padded',
+                  _aggregate_metrics=lambda *args: {})
+        with patch('meshy.backend.titan.trainer.plan_stats', return_value={}):
+            TitanTrainer.train_step(stub, [], plan=plans)
+        self.assertEqual(events, ['snapshot', 'snapshot', 'update', 'update'])
+
 
 if __name__ == '__main__':
     unittest.main()
