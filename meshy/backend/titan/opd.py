@@ -121,6 +121,9 @@ class TopKBatch(Batch):
 
 
 class StudentTopKTrainer(TitanTrainer):
+    # the distillation loss has no PPO ratio, so train_step skips the snapshot
+    needs_behaviour_logprobs = False
+
     def __init__(
         self,
         *args: Any,
@@ -196,7 +199,9 @@ class StudentTopKTrainer(TitanTrainer):
     # ------------------------------------------------------------------
     # Mini-batch loop
     # ------------------------------------------------------------------
-    def _run_mini_batch(self, samples: Sequence[Any], mini: MiniPlan, timer) -> tuple[dict[str, float], torch.Tensor]:
+    def _run_mini_batch(
+        self, samples: Sequence[Any], mini: MiniPlan, timer, old_lps=None
+    ) -> tuple[dict[str, float], torch.Tensor]:
         sums: dict[str, torch.Tensor] | None = None
         self.optimizers.zero_grad()
         for micro in mini.micros:

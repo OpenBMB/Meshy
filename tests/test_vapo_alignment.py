@@ -171,7 +171,7 @@ class VapoAlignment(unittest.TestCase):
             self.assertEqual(float(old[0]), 0.)
             return {}, None
         stub = NS(timer_enabled=False, enable_gae=False, old_logprobs_source='train',
-                  use_icepop=True,
+                  use_icepop=True, needs_behaviour_logprobs=True,
                   _compute_old_logprobs_train=snapshot, _run_mini_batch=update,
                   lr_schedulers=NS(step=lambda: None), step=0, batch_layout='padded',
                   _aggregate_metrics=lambda *args: {})
