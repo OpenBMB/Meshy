@@ -88,6 +88,9 @@ class TitanTrainer(ForgeEngine):
     max_tokens_per_micro: int | None
     seq_align: int
     planner_config: PlannerConfig
+    # train_step snapshots the behaviour policy once per step for the PPO ratio;
+    # a subclass whose loss has no ratio turns it off
+    needs_behaviour_logprobs: bool = True
     ppo_clip_eps_low: float
     ppo_clip_eps_high: float
     old_logprobs_source: Literal["rollout", "train"]
@@ -863,15 +866,10 @@ class TitanTrainer(ForgeEngine):
         ``None`` the rank plans ``samples`` on its own as a single-rank job,
         which is what ``world_size == 1`` and the unit tests want.
 
-        With IcePop, freeze all mini-batches' training log-probabilities on
-        CPU before the first optimizer update in this window. Legacy
-        ``old_logprobs_source='train'`` without IcePop snapshots per mini.
-
-        Layout per mini-batch (one ``optimizer.step()`` each):
-        1. Snapshot the behavior-policy log-probs for the mini-batch's
-           micro plan — rollout log-probs come with the samples, ``"train"``
-           runs a no-grad forward over the same micro-batches *before* the
-           optimizer moves (window-wide when IcePop is enabled).
+        Layout (one ``optimizer.step()`` per mini-batch):
+        1. Snapshot the behavior-policy log-probs — rollout log-probs come
+           with the samples; ``"train"`` runs a no-grad forward over every
+           mini-batch's micro plan once, before the first optimizer step.
         2. For every micro-batch: build it, forward, PPO loss normalised by
            the mini-batch's global denominators, backward.
         3. Clip + step.
@@ -912,17 +910,25 @@ class TitanTrainer(ForgeEngine):
                         max(1, self.parallel_dims.cp),
                     )
 
+        # The behaviour policy is the weights *before* this step's first
+        # optimizer.step(), so every mini-batch's old log-probs are taken now.
+        # Taking them inside each mini-batch would use weights the earlier
+        # mini-batches already moved: ratio == 1 for every token and the PPO
+        # clip / TIS never engage.
+        old_lps_per_mini: list[list[torch.Tensor] | None] = [None] * len(plan)
+        if self.needs_behaviour_logprobs and self.old_logprobs_source == "train":
+            with timer.timer("train/old_logprobs", sync=True):
+                old_lps_per_mini = [
+                    self._compute_old_logprobs_train(samples, mini) for mini in plan
+                ]
+
         all_metrics: list[dict[str, float]] = []
         grad_norms: list[torch.Tensor] = []
-        snapshots = None
-        if self.old_logprobs_source == "train" and getattr(self, "use_icepop", False):
-            with timer.timer("train/old_logprobs", sync=True):
-                snapshots = [self._compute_old_logprobs_train(samples, mini) for mini in plan]
-        for index, mini in enumerate(plan):
-            if snapshots is None:
-                mini_metrics, grad_norm = self._run_mini_batch(samples, mini, timer)
-            else:
-                mini_metrics, grad_norm = self._run_mini_batch(samples, mini, timer, snapshots[index])
+        for i, mini in enumerate(plan):
+            mini_metrics, grad_norm = self._run_mini_batch(
+                samples, mini, timer, old_lps_per_mini[i]
+            )
+            old_lps_per_mini[i] = None  # free this mini-batch's snapshot
             all_metrics.append(mini_metrics)
             grad_norms.append(grad_norm)
 
@@ -952,17 +958,13 @@ class TitanTrainer(ForgeEngine):
 
         Every micro-batch's loss is already scaled by the mini-batch's global
         denominator, so the micro losses are simply summed (no ``1/n_micro``).
+        ``old_lps`` is the behaviour-policy snapshot :meth:`train_step` took
+        for this mini-batch before any optimizer step (``"train"`` source);
+        ``None`` means the rollout log-probs carried by the batch.
         Returns the mini-batch's globally reduced metrics and gradient norm.
         """
-        with timer.timer("train/old_logprobs", sync=True):
-            if old_lps is not None:
-                pass
-            elif self.old_logprobs_source == "train":
-                old_lps = list(
-                    self._compute_old_logprobs_train(samples, mini)
-                )
-            else:
-                old_lps = [None] * len(mini.micros)
+        if old_lps is None:
+            old_lps = [None] * len(mini.micros)
 
         sums: dict[str, torch.Tensor] | None = None
         self.optimizers.zero_grad()
